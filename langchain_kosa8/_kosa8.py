@@ -10,6 +10,19 @@ and needs nothing but ``httpx``. What it relies on:
   ``POST /v1/sandboxes/{id}/sleep`` and ``/wake``, ``GET /v1/templates``.
 * ``POST /v1/sandboxes/{id}/exec`` with ``{"cmd": [...], "env": [...]}``.
 
+The clients also cover the rest of the sandbox API for callers who want it:
+``PATCH`` (lifetime), list with ``limit``/``cursor`` paging, and the data-plane
+routes (files, checkpoints, rewind, fork, ports). The data-plane routes answer
+501 (:class:`Kosa8NotSupportedError`) on hosts without the data plane, and not
+every kosa8 Cloud host has it yet, so the integrations themselves do not rely
+on them.
+
+Errors are typed: :class:`Kosa8PaymentRequiredError` (402, with
+``upgrade_url`` and ``agent_message``), :class:`Kosa8OrgFrozenError` (423),
+:class:`Kosa8RateLimitError` (429), :class:`Kosa8ExecTimeoutError` (an exec cut
+off by the API's time limit) and :class:`Kosa8NotSupportedError` (501). All are
+:class:`Kosa8Error` with ``status`` and ``code``.
+
 How commands run on kosa8 Cloud today, and what this module does about it:
 
 * Every exec starts a fresh container from the sandbox's template image (or the
@@ -19,8 +32,8 @@ How commands run on kosa8 Cloud today, and what this module does about it:
   command ends. So that tools which use ``/tmp`` keep working, each command
   first links (or bind-mounts) ``/tmp`` onto ``/workspace/.kosa8-persist/tmp``.
   The list of such directories is configurable (``persist_dirs``).
-* The API has no file endpoints on production hosts yet, so file upload and
-  download go through exec: the bytes travel base64-encoded, in chunks sized
+* The file endpoints need the host's data plane, which production hosts do
+  not all have yet, so file upload and download go through exec: the bytes travel base64-encoded, in chunks sized
   to the API's request (64 KiB) and output (1 MiB) limits.
 * A buffered exec must finish within the host's request time (about 30 s).
   When the host offers streamed exec, it is used instead and long commands
@@ -39,10 +52,10 @@ import re
 import shlex
 import time
 import uuid
-from collections.abc import Generator, Mapping, Sequence
+from collections.abc import AsyncIterator, Generator, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, TypeVar
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 import httpx
 
@@ -55,7 +68,13 @@ __all__ = [
     "ExecRequest",
     "Kosa8Client",
     "Kosa8Error",
+    "Kosa8ExecTimeoutError",
+    "Kosa8NotSupportedError",
+    "Kosa8OrgFrozenError",
+    "Kosa8PaymentRequiredError",
+    "Kosa8RateLimitError",
     "Kosa8TimeoutError",
+    "SandboxPage",
     "SandboxSession",
 ]
 
@@ -74,6 +93,11 @@ MAX_ENV_ENTRIES = 128
 MAX_ARG_CHARS = 8192
 # The host gives a buffered exec about 30 s; wait a little longer for its answer.
 BUFFERED_REQUEST_TIMEOUT_S = 45.0
+EXEC_LIMIT_S = 30
+# A ttl_s is from 60 s to 90 days; a fork makes 1 to 100 copies.
+MIN_TTL_S = 60
+MAX_TTL_S = 7_776_000
+MAX_FORK = 100
 
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _DROPPED_RE = re.compile(r"\n\[k8agent: \d+ bytes of output dropped\]\n")
@@ -83,15 +107,76 @@ _HOST_TIMEOUT_RE = re.compile(r"time(d)? ?out|deadline|context canceled|aborted"
 class Kosa8Error(Exception):
     """An error answered by kosa8 Cloud, or a failure to reach it."""
 
-    def __init__(self, message: str, *, status: int | None = None, code: str | None = None) -> None:
+    def __init__(self, message: str, *, status: int | None = None, code: str | None = None, body: Any = None) -> None:
         super().__init__(message)
         self.status = status
         self.code = code
         self.message = message
+        #: The decoded error body, when there was one.
+        self.body = body
 
 
 class Kosa8TimeoutError(Kosa8Error, TimeoutError):
     """A command or request did not finish in time."""
+
+
+class Kosa8ExecTimeoutError(Kosa8TimeoutError):
+    """An exec was cut off by the API's time limit.
+
+    A buffered exec is limited to about 30 s today (HTTP 502 "timed out"; later
+    servers answer 504 ``exec_timeout``). Streamed exec, used when the host
+    offers it, is not cut off.
+    """
+
+
+class Kosa8PaymentRequiredError(Kosa8Error):
+    """402: new work is refused until a payment method or credit is on file
+    (``payment_required``), or the spending cap is reached
+    (``spending_cap_reached``).
+
+    ``upgrade_url`` is where the person fixes it; ``agent_message`` is a
+    sentence an agent should relay to its person word for word, then stop.
+    """
+
+    @property
+    def upgrade_url(self) -> str | None:
+        return _body_str(self.body, "upgrade_url")
+
+    @property
+    def agent_message(self) -> str | None:
+        return _body_str(self.body, "agent_message")
+
+
+class Kosa8OrgFrozenError(Kosa8Error):
+    """423 ``org_frozen``: the org is frozen in the Security Center; an owner or admin must unfreeze it."""
+
+
+class Kosa8RateLimitError(Kosa8Error):
+    """429: too many requests, or ``quota_exceeded`` (the org's active sandbox limit).
+
+    ``retry_after`` is the server's Retry-After in seconds, when it sent one.
+    """
+
+    retry_after: float | None = None
+
+
+class Kosa8NotSupportedError(Kosa8Error):
+    """501: the sandbox's host cannot do this yet (``not_available`` / ``not_supported``)."""
+
+
+def _body_str(body: Any, key: str) -> str | None:
+    if isinstance(body, dict) and isinstance(body.get(key), str) and body[key]:
+        return body[key]
+    return None
+
+
+@dataclass
+class SandboxPage:
+    """One page of sandboxes; ``next_cursor`` is ``None`` on the last page,
+    and always on a server that does not page yet."""
+
+    sandboxes: list[dict[str, Any]]
+    next_cursor: str | None = None
 
 
 @dataclass
@@ -169,10 +254,33 @@ def _error_from_response(resp: httpx.Response) -> Kosa8Error:
             message = code
     elif resp.text:
         message = f"{message}: {resp.text[:300]}"
-    cls = Kosa8Error
-    if resp.status_code in (502, 504) and _HOST_TIMEOUT_RE.search(message):
+    status = resp.status_code
+    try:
+        on_exec = resp.request.url.path.endswith("/exec")
+    except RuntimeError:  # a Response built without a request
+        on_exec = False
+    cls: type[Kosa8Error] = Kosa8Error
+    if code == "exec_timeout" or (on_exec and status in (502, 504) and _HOST_TIMEOUT_RE.search(message)):
+        cls = Kosa8ExecTimeoutError
+        message = f"{message} (a buffered exec is limited to about {EXEC_LIMIT_S} s)"
+    elif status in (502, 504) and _HOST_TIMEOUT_RE.search(message):
         cls = Kosa8TimeoutError
-    return cls(message, status=resp.status_code, code=code)
+    elif status == 402:
+        cls = Kosa8PaymentRequiredError
+    elif status == 423:
+        cls = Kosa8OrgFrozenError
+    elif status == 429:
+        cls = Kosa8RateLimitError
+    elif status == 501:
+        cls = Kosa8NotSupportedError
+    err = cls(message, status=status, code=code, body=body)
+    if isinstance(err, Kosa8RateLimitError):
+        ra = resp.headers.get("retry-after")
+        try:
+            err.retry_after = float(ra) if ra is not None else None
+        except ValueError:
+            err.retry_after = None
+    return err
 
 
 def _exec_body(argv: Sequence[str], env: Mapping[str, str], stream: bool, image: str | None = None) -> dict[str, Any]:
@@ -265,12 +373,27 @@ def _sandbox_path(sandbox_id: str, suffix: str = "") -> str:
     return f"/v1/sandboxes/{quote(sandbox_id, safe='')}{suffix}"
 
 
+def _is_int(v: Any) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _check_lifetime(ttl_s: int | None, delete_after: int | None) -> None:
+    if ttl_s is not None and delete_after is not None:
+        raise ValueError("give ttl_s or delete_after, not both")
+    if ttl_s is not None and (not _is_int(ttl_s) or not MIN_TTL_S <= ttl_s <= MAX_TTL_S):
+        raise ValueError(f"ttl_s must be a whole number of seconds from {MIN_TTL_S} to {MAX_TTL_S}")
+    if delete_after is not None and not _is_int(delete_after):
+        raise ValueError("delete_after must be a Unix time in milliseconds")
+
+
 def _create_body(
     template: str | None,
     region: str | None,
     sleep_after_s: int | None,
     ttl_s: int | None,
+    delete_after: int | None = None,
 ) -> dict[str, Any]:
+    _check_lifetime(ttl_s, delete_after)
     body: dict[str, Any] = {}
     if template is not None:
         body["template"] = template
@@ -280,7 +403,59 @@ def _create_body(
         body["sleep_after_s"] = sleep_after_s
     if ttl_s is not None:
         body["ttl_s"] = ttl_s
+    if delete_after is not None:
+        body["delete_after"] = delete_after
     return body
+
+
+def _update_body(
+    ttl_s: int | None, delete_after: int | None, sleep_after_s: int | None, clear_lifetime: bool
+) -> dict[str, Any]:
+    if clear_lifetime and (ttl_s is not None or delete_after is not None):
+        raise ValueError("clear_lifetime cannot be combined with ttl_s or delete_after")
+    _check_lifetime(ttl_s, delete_after)
+    body: dict[str, Any] = {}
+    if clear_lifetime:
+        body["ttl_s"] = None
+    if ttl_s is not None:
+        body["ttl_s"] = ttl_s
+    if delete_after is not None:
+        body["delete_after"] = delete_after
+    if sleep_after_s is not None:
+        body["sleep_after_s"] = sleep_after_s
+    if not body:
+        raise ValueError("give ttl_s, delete_after, sleep_after_s or clear_lifetime")
+    return body
+
+
+def _list_path(all: bool, limit: int | None, cursor: str | None) -> str:
+    q: dict[str, str] = {}
+    if all:
+        q["all"] = "1"
+    if limit is not None:
+        if not _is_int(limit) or limit < 1:
+            raise ValueError("limit must be a positive whole number")
+        q["limit"] = str(limit)
+    if cursor:
+        q["cursor"] = cursor
+    return "/v1/sandboxes" + ("?" + urlencode(q) if q else "")
+
+
+def _page(r: Any) -> SandboxPage:
+    r = r or {}
+    nxt = r.get("next_cursor")
+    return SandboxPage(sandboxes=list(r.get("sandboxes", [])), next_cursor=nxt if isinstance(nxt, str) and nxt else None)
+
+
+def _file_path(sandbox_id: str, suffix: str, path: str, **extra: str) -> str:
+    if not path:
+        raise ValueError("a path is required, e.g. /workspace/app.py")
+    return _sandbox_path(sandbox_id, suffix) + "?" + urlencode({"path": path, **extra})
+
+
+def _check_fork(n: int) -> None:
+    if not _is_int(n) or not 1 <= n <= MAX_FORK:
+        raise ValueError(f"n must be a whole number from 1 to {MAX_FORK}")
 
 
 class Kosa8Client:
@@ -334,13 +509,21 @@ class Kosa8Client:
             "User-Agent": "kosa8-integrations",
         }
 
-    def _request(self, method: str, path: str, body: Any = None, timeout: float | None = None) -> Any:
+    def _request(
+        self, method: str, path: str, body: Any = None, timeout: float | None = None, *, content: bytes | None = None, raw: bool = False
+    ) -> Any:
+        headers = self._headers()
+        if content is not None:
+            headers["Content-Type"] = "application/octet-stream"
+        if raw:
+            headers["Accept"] = "application/octet-stream"
         try:
             resp = self._http.request(
                 method,
                 self.base_url + path,
-                headers=self._headers(),
-                json=body,
+                headers=headers,
+                json=body if content is None else None,
+                content=content,
                 timeout=timeout if timeout is not None else self.timeout,
             )
         except httpx.TimeoutException as e:
@@ -349,6 +532,8 @@ class Kosa8Client:
             raise Kosa8Error(f"could not reach kosa8 Cloud at {self.base_url}: {e}") from e
         if resp.status_code >= 400:
             raise _error_from_response(resp)
+        if raw:
+            return resp.content
         if not resp.content:
             return None
         try:
@@ -365,10 +550,77 @@ class Kosa8Client:
         region: str | None = None,
         sleep_after_s: int | None = None,
         ttl_s: int | None = None,
+        delete_after: int | None = None,
     ) -> dict[str, Any]:
-        """Start a sandbox and return its record once it is running."""
-        r = self._request("POST", "/v1/sandboxes", _create_body(template, region, sleep_after_s, ttl_s), timeout=max(self.timeout, 90.0))
+        """Start a sandbox and return its record once it is running.
+
+        ``ttl_s`` (60 s to 90 days) or ``delete_after`` (Unix ms) deletes it automatically.
+        """
+        body = _create_body(template, region, sleep_after_s, ttl_s, delete_after)
+        r = self._request("POST", "/v1/sandboxes", body, timeout=max(self.timeout, 90.0))
         return r["sandbox"]
+
+    def list_sandboxes(self, *, all: bool = False, limit: int | None = None, cursor: str | None = None) -> SandboxPage:
+        """One page of the org's sandboxes, newest first."""
+        return _page(self._request("GET", _list_path(all, limit, cursor)))
+
+    def iter_sandboxes(self, *, all: bool = False, page_size: int | None = None) -> Iterator[dict[str, Any]]:
+        """Every sandbox, following ``next_cursor``; one page on a server that does not page."""
+        cursor: str | None = None
+        seen: set[str] = set()
+        while True:
+            page = self.list_sandboxes(all=all, limit=page_size, cursor=cursor)
+            yield from page.sandboxes
+            if not page.next_cursor or page.next_cursor in seen:
+                return
+            seen.add(page.next_cursor)
+            cursor = page.next_cursor
+
+    def update_sandbox(
+        self,
+        sandbox_id: str,
+        *,
+        ttl_s: int | None = None,
+        delete_after: int | None = None,
+        sleep_after_s: int | None = None,
+        clear_lifetime: bool = False,
+    ) -> dict[str, Any]:
+        """Change a sandbox's lifetime or sleep timer (PATCH)."""
+        body = _update_body(ttl_s, delete_after, sleep_after_s, clear_lifetime)
+        return self._request("PATCH", _sandbox_path(sandbox_id), body)["sandbox"]
+
+    # Data plane: may answer 501 (Kosa8NotSupportedError) on current hosts ------
+
+    def read_file(self, sandbox_id: str, path: str) -> bytes:
+        """A file's bytes (at most 8 MiB). Data plane: may answer 501 on current hosts."""
+        return self._request("GET", _file_path(sandbox_id, "/files", path), raw=True)
+
+    def write_file(self, sandbox_id: str, path: str, data: bytes) -> dict[str, Any]:
+        """Create or replace a file (at most 8 MiB). Data plane: may answer 501 on current hosts."""
+        return (self._request("PUT", _file_path(sandbox_id, "/files", path), content=bytes(data)) or {}).get("file", {})
+
+    def list_files(self, sandbox_id: str, path: str = DEFAULT_WORKSPACE) -> list[dict[str, Any]]:
+        """A folder's entries. Data plane: may answer 501 on current hosts."""
+        return (self._request("GET", _file_path(sandbox_id, "/files/list", path)) or {}).get("files", [])
+
+    def create_checkpoint(self, sandbox_id: str, label: str | None = None) -> dict[str, Any]:
+        """Save memory, processes and disk. Data plane: may answer 501 on current hosts."""
+        body = {"label": label} if label is not None else {}
+        return self._request("POST", _sandbox_path(sandbox_id, "/checkpoints"), body)["checkpoint"]
+
+    def list_checkpoints(self, sandbox_id: str) -> list[dict[str, Any]]:
+        """Checkpoints, oldest first. Data plane: may answer 501 on current hosts."""
+        return (self._request("GET", _sandbox_path(sandbox_id, "/checkpoints")) or {}).get("checkpoints", [])
+
+    def rewind_sandbox(self, sandbox_id: str, checkpoint_id: str) -> dict[str, Any]:
+        """Go back to a checkpoint; answers ``{sandbox, checkpoint, backup, ms}``.
+        Data plane: may answer 501 on current hosts."""
+        return self._request("POST", _sandbox_path(sandbox_id, "/rewind"), {"checkpoint_id": checkpoint_id})
+
+    def fork_sandbox(self, sandbox_id: str, n: int = 1) -> list[dict[str, Any]]:
+        """``n`` (1 to 100) copies of the sandbox as it is now. Data plane: may answer 501 on current hosts."""
+        _check_fork(n)
+        return (self._request("POST", _sandbox_path(sandbox_id, "/fork"), {"n": n}) or {}).get("sandboxes", [])
 
     def get_sandbox(self, sandbox_id: str) -> dict[str, Any]:
         return self._request("GET", _sandbox_path(sandbox_id))["sandbox"]
@@ -472,13 +724,21 @@ class AsyncKosa8Client:
             "User-Agent": "kosa8-integrations",
         }
 
-    async def _request(self, method: str, path: str, body: Any = None, timeout: float | None = None) -> Any:
+    async def _request(
+        self, method: str, path: str, body: Any = None, timeout: float | None = None, *, content: bytes | None = None, raw: bool = False
+    ) -> Any:
+        headers = self._headers()
+        if content is not None:
+            headers["Content-Type"] = "application/octet-stream"
+        if raw:
+            headers["Accept"] = "application/octet-stream"
         try:
             resp = await self._http.request(
                 method,
                 self.base_url + path,
-                headers=self._headers(),
-                json=body,
+                headers=headers,
+                json=body if content is None else None,
+                content=content,
                 timeout=timeout if timeout is not None else self.timeout,
             )
         except httpx.TimeoutException as e:
@@ -487,6 +747,8 @@ class AsyncKosa8Client:
             raise Kosa8Error(f"could not reach kosa8 Cloud at {self.base_url}: {e}") from e
         if resp.status_code >= 400:
             raise _error_from_response(resp)
+        if raw:
+            return resp.content
         if not resp.content:
             return None
         try:
@@ -501,9 +763,63 @@ class AsyncKosa8Client:
         region: str | None = None,
         sleep_after_s: int | None = None,
         ttl_s: int | None = None,
+        delete_after: int | None = None,
     ) -> dict[str, Any]:
-        r = await self._request("POST", "/v1/sandboxes", _create_body(template, region, sleep_after_s, ttl_s), timeout=max(self.timeout, 90.0))
+        body = _create_body(template, region, sleep_after_s, ttl_s, delete_after)
+        r = await self._request("POST", "/v1/sandboxes", body, timeout=max(self.timeout, 90.0))
         return r["sandbox"]
+
+    async def list_sandboxes(self, *, all: bool = False, limit: int | None = None, cursor: str | None = None) -> SandboxPage:
+        return _page(await self._request("GET", _list_path(all, limit, cursor)))
+
+    async def iter_sandboxes(self, *, all: bool = False, page_size: int | None = None) -> AsyncIterator[dict[str, Any]]:
+        cursor: str | None = None
+        seen: set[str] = set()
+        while True:
+            page = await self.list_sandboxes(all=all, limit=page_size, cursor=cursor)
+            for sb in page.sandboxes:
+                yield sb
+            if not page.next_cursor or page.next_cursor in seen:
+                return
+            seen.add(page.next_cursor)
+            cursor = page.next_cursor
+
+    async def update_sandbox(
+        self,
+        sandbox_id: str,
+        *,
+        ttl_s: int | None = None,
+        delete_after: int | None = None,
+        sleep_after_s: int | None = None,
+        clear_lifetime: bool = False,
+    ) -> dict[str, Any]:
+        body = _update_body(ttl_s, delete_after, sleep_after_s, clear_lifetime)
+        return (await self._request("PATCH", _sandbox_path(sandbox_id), body))["sandbox"]
+
+    # Data plane: may answer 501 (Kosa8NotSupportedError) on current hosts ------
+
+    async def read_file(self, sandbox_id: str, path: str) -> bytes:
+        return await self._request("GET", _file_path(sandbox_id, "/files", path), raw=True)
+
+    async def write_file(self, sandbox_id: str, path: str, data: bytes) -> dict[str, Any]:
+        return (await self._request("PUT", _file_path(sandbox_id, "/files", path), content=bytes(data)) or {}).get("file", {})
+
+    async def list_files(self, sandbox_id: str, path: str = DEFAULT_WORKSPACE) -> list[dict[str, Any]]:
+        return (await self._request("GET", _file_path(sandbox_id, "/files/list", path)) or {}).get("files", [])
+
+    async def create_checkpoint(self, sandbox_id: str, label: str | None = None) -> dict[str, Any]:
+        body = {"label": label} if label is not None else {}
+        return (await self._request("POST", _sandbox_path(sandbox_id, "/checkpoints"), body))["checkpoint"]
+
+    async def list_checkpoints(self, sandbox_id: str) -> list[dict[str, Any]]:
+        return (await self._request("GET", _sandbox_path(sandbox_id, "/checkpoints")) or {}).get("checkpoints", [])
+
+    async def rewind_sandbox(self, sandbox_id: str, checkpoint_id: str) -> dict[str, Any]:
+        return await self._request("POST", _sandbox_path(sandbox_id, "/rewind"), {"checkpoint_id": checkpoint_id})
+
+    async def fork_sandbox(self, sandbox_id: str, n: int = 1) -> list[dict[str, Any]]:
+        _check_fork(n)
+        return (await self._request("POST", _sandbox_path(sandbox_id, "/fork"), {"n": n}) or {}).get("sandboxes", [])
 
     async def get_sandbox(self, sandbox_id: str) -> dict[str, Any]:
         return (await self._request("GET", _sandbox_path(sandbox_id)))["sandbox"]

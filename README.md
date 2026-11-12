@@ -6,12 +6,14 @@
 
 ## Install
 
+`langchain-kosa8` is not on PyPI yet. Install it from GitHub until the PyPI release:
+
 ```bash
-pip install langchain-kosa8
+pip install "git+https://github.com/kosa8ai/langchain-kosa8"
 ```
 
 ```bash
-uv add langchain-kosa8
+uv pip install "git+https://github.com/kosa8ai/langchain-kosa8"
 ```
 
 You need a kosa8 Cloud API key. Create one in the kosa8 Cloud dashboard and export it:
@@ -89,19 +91,28 @@ and passes the rest to the constructor:
 
 Lifecycle helpers: `sleep()`, `wake()`, `delete()`, `close()` (and `asleep()`, `awake()`, `adelete()`, `aclose()`).
 
+## kosa8 Cloud basics
+
+- The address is `https://api.kosa8.com` (`KOSA8_CLOUD_URL` overrides it; https only, except localhost).
+- The `base` template is **Alpine Linux**: `sh` is busybox, and there is no `bash`, `python` or `git`. The `python` template adds Python 3. `GET /v1/templates` lists what your org can start.
+- Each command runs in a fresh container; **only `/workspace` persists** between commands (this package also keeps `/tmp`, see below). Install packages into `/workspace`.
+- A buffered exec is cut off after about **30 seconds**; streamed exec, used when the host offers it, is not.
+- Errors from the bundled client (`langchain_kosa8._kosa8`) are typed, all subclasses of `Kosa8Error` with `status` and `code`: `Kosa8PaymentRequiredError` (402; show `upgrade_url`, and an agent should relay `agent_message` and stop), `Kosa8OrgFrozenError` (423 `org_frozen`: an owner or admin must unfreeze the org), `Kosa8RateLimitError` (429, `retry_after`), `Kosa8ExecTimeoutError` (an exec cut off by the 30 s limit; also a `Kosa8TimeoutError`) and `Kosa8NotSupportedError` (501).
+- The bundled client also covers `update_sandbox` (PATCH lifetime), `list_sandboxes`/`iter_sandboxes` (with `limit`/`cursor` paging when the server offers it), and the data-plane calls `read_file`, `write_file`, `list_files`, `create_checkpoint`, `list_checkpoints`, `rewind_sandbox` and `fork_sandbox`. The data-plane calls may answer 501 `not_supported` on current hosts, so this package's own behaviour does not depend on them.
+
 ## How it works, and the limits that follow
 
 kosa8 Cloud's public API today offers create, exec, sleep, wake and delete on every host. This package uses only those calls, so it works on any kosa8 Cloud host. That shapes the behaviour:
 
 - **Each command runs in a fresh container** from the template image, over the sandbox's persistent `/workspace` disk. Files under `/workspace` carry from one command to the next and through sleep; files written elsewhere do not. Commands start in `/workspace`, so relative paths land there. Shell state (`cd`, exported variables) does not carry between commands, as with other `BaseSandbox` backends.
 - **`/tmp` is kept too.** Deep Agents writes temporary files to `/tmp` in one call and reads them in the next, so before each command the package bind-mounts or links `/tmp` onto `/workspace/.kosa8-persist/tmp`. Add other directories with `persist_dirs`. Packages installed into system directories (for example with `apk add` or `pip install` into site-packages) do not persist; install into `/workspace` (for example a virtualenv there) or use a template that already has them.
-- **Files travel through exec.** The production API has no file endpoints yet, so `upload_files()` and `download_files()` move bytes as base64 in chunks: about 36 KB per upload request (the API accepts 64 KiB of JSON per request) and 512 KiB per download request. A 10 MiB file takes about 290 requests to upload and 20 to download. The image needs `sh`, `base64` and `dd`, which the kosa8 templates have.
+- **Files travel through exec.** The native file endpoints need the host's data plane, which not every production host has yet, so `upload_files()` and `download_files()` move bytes as base64 in chunks: about 36 KB per upload request (the API accepts 64 KiB of JSON per request) and 512 KiB per download request. A 10 MiB file takes about 290 requests to upload and 20 to download. The image needs `sh`, `base64` and `dd`, which the kosa8 templates have.
 - **Long commands.** A buffered exec has to finish within the host's request time, about 30 seconds. When a host offers streamed exec the package uses it and long commands run to their `timeout`; otherwise a command that runs past the host's limit returns exit code `124` with an explanation. Start long jobs so they finish in time, or split them up.
 - **Output.** A buffered exec keeps the first and last 1 MiB of each stream; when output is cut, `truncated` is `True`.
 - **No stdin, user or port APIs.** Commands run as the image's default user.
 - **grep on Alpine images.** The `python` template is Alpine-based, and busybox `grep` lacks the `-Z` flag that `BaseSandbox.grep()` uses. The package detects this once per sandbox and searches with a Python 3 script that returns the same results. With GNU grep or ripgrep in the image, `BaseSandbox.grep()` is used unchanged.
 
-Not covered by this package: kosa8's checkpoint, rewind, fork and native file endpoints. They need a host with the kosa8 data plane, which production hosts do not offer yet, so this package does not call them.
+Not used by the backend: kosa8's checkpoint, rewind, fork and native file endpoints. They need a host with the kosa8 data plane, which not every production host offers yet. The bundled client has methods for them (see above) if you want to call them yourself.
 
 ## Tests
 
