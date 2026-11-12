@@ -1,0 +1,52 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "langchain-kosa8"
+version = "0.1.0"
+description = "kosa8 Cloud sandbox integration for LangChain Deep Agents"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "kosa8" }]
+requires-python = ">=3.11,<4.0"
+keywords = ["langchain", "deepagents", "sandbox", "kosa8", "microvm", "agents"]
+classifiers = [
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "deepagents>=0.7.35,<0.8.0",
+    "httpx>=0.27",
+]
+
+[project.urls]
+Homepage = "https://kosa8.com"
+Documentation = "https://github.com/kosa8ai/langchain-kosa8#readme"
+Repository = "https://github.com/kosa8ai/langchain-kosa8"
+Issues = "https://github.com/kosa8ai/langchain-kosa8/issues"
+
+[dependency-groups]
+test = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "langchain-tests>=1.1.9",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["langchain_kosa8"]
+
+[tool.hatch.build.targets.sdist]
+include = ["langchain_kosa8", "tests", "README.md", "LICENSE"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 140
