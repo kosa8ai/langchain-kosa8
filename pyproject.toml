@@ -37,6 +37,13 @@ test = [
     "pytest-asyncio>=0.23",
     "langchain-tests>=1.1.9",
 ]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "langchain-tests>=1.1.9",
+    "ruff>=0.6",
+    "mypy>=1.10",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["langchain_kosa8"]
@@ -47,6 +54,23 @@ include = ["langchain_kosa8", "tests", "README.md", "LICENSE"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 
 [tool.ruff]
 line-length = 140
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "ASYNC", "RUF100"]
+# Deep Agents and the vendored transport name their parameters `timeout`.
+ignore = ["ASYNC109"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["ASYNC"]
+"langchain_kosa8/_grep.py" = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = false
+files = ["langchain_kosa8"]

@@ -6,8 +6,9 @@ generated from `scripts/data/integration_external_docs.yaml` in
 [langchain-ai/docs](https://github.com/langchain-ai/docs). Their process for a
 new entry is an **integration-listing issue**, not a hand-written PR: a
 maintainer reviews the issue, applies the `integration-run` label, and a
-workflow opens the docs PR from the issue's fields (example: issue #7084 led to
-PR #7090).
+workflow opens the docs PR from the issue's fields (example: boxd's issue
+#7617 led to PR #7622; boxd's hand-written PR #7473 was closed and sent to the
+form).
 
 The issue form requires that the package is already on PyPI. So:
 
@@ -19,5 +20,6 @@ The issue form requires that the package is already on PyPI. So:
    <https://github.com/langchain-ai/docs/issues/new?template=06-integration-submission.yml>
    with the fields in [`langchain-docs-issue.md`](langchain-docs-issue.md).
 
-If a maintainer asks for a PR instead, [`langchain-docs-pr.md`](langchain-docs-pr.md)
-has the YAML entry and a PR description.
+If a maintainer asks for a PR instead, the branch
+`drvt69talati/docs-1:docs/kosa8-sandbox` has the four-file change the automation
+makes (as in #7622), and [`langchain-docs-pr.md`](langchain-docs-pr.md) a PR description.

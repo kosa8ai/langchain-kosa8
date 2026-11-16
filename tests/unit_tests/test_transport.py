@@ -30,7 +30,7 @@ def session(tmp_path: Path) -> k.SandboxSession:
     return k.SandboxSession(workspace=str(ws), persist_dirs=())
 
 
-def run(client: k.Kosa8Client, sid: str, op):  # noqa: ANN001, ANN202
+def run(client: k.Kosa8Client, sid: str, op):
     return k.drive(op, lambda req: client.exec(sid, req))
 
 

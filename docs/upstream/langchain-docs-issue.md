@@ -13,9 +13,9 @@ Form: <https://github.com/langchain-ai/docs/issues/new?template=06-integration-s
 | npm package name | (leave blank) |
 | Docs URL | `https://github.com/kosa8ai/langchain-kosa8#readme` |
 | Source repository | `kosa8ai/langchain-kosa8` |
-| Short provider description | `kosa8 Cloud runs agent code in microVM sandboxes that can sleep and wake with their files kept.` |
+| Short provider description | `Deep Agents sandbox backend that runs an agent's commands and files in a kosa8 Cloud microVM that can sleep and wake with its files kept.` |
 | Capability flags | (leave blank) |
 | Confirmation | Tick "The package is already published on PyPI and/or npm." only after it is. |
 
-The description is 95 characters (limit 160). Check before submitting that it
+The description is 137 characters (limit 160), in the style of the BoxdSandbox listing (issue #7617, PR #7622). Check before submitting that it
 still matches what kosa8 Cloud offers.

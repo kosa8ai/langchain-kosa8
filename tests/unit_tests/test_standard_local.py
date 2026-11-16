@@ -24,8 +24,8 @@ import pytest
 from deepagents.backends.protocol import SandboxBackendProtocol
 
 from langchain_kosa8 import AsyncKosa8Client, Kosa8Client, Kosa8Sandbox
-from tests.standard_overrides import StandardOverrides
 from tests.fake_cloud import FakeCloud, container_runner
+from tests.standard_overrides import StandardOverrides
 
 CONTAINER = os.environ.get("KOSA8_TEST_CONTAINER")
 
@@ -45,17 +45,18 @@ class TestKosa8SandboxAgainstFakeCloud(StandardOverrides):
     @pytest.fixture(scope="class")
     def sandbox(self, tmp_path_factory: pytest.TempPathFactory) -> Iterator[SandboxBackendProtocol]:
         if CONTAINER:
-            cloud = FakeCloud(runner=container_runner(CONTAINER, os.environ.get("KOSA8_TEST_ENGINE", "kosa8")))
+            # The fake's files API reaches this machine's disk, not the container's.
+            cloud = FakeCloud(runner=container_runner(CONTAINER, os.environ.get("KOSA8_TEST_ENGINE", "kosa8")), files_api=False)
             ws, persist = "/workspace", ("/tmp",)
             cloud.runner(["/bin/sh", "-c", "mkdir -p /workspace && rm -rf /workspace/test_sandbox_ops"], {}, 60)  # type: ignore[misc]
         else:
-            cloud = FakeCloud()
             ws, persist = str(tmp_path_factory.mktemp("workspace").resolve()), ()
+            cloud = FakeCloud(files_root=ws)
         type(self)._root = ws
-        client = Kosa8Client(api_key=cloud.api_key, http_client=cloud.client())
+        client = Kosa8Client(api_key=cloud.api_key, http_client=cloud.client(), files_root=ws)
         backend = Kosa8Sandbox.create(client=client, workspace=ws, persist_dirs=persist)
-        backend._async_client = AsyncKosa8Client(api_key=cloud.api_key, http_client=cloud.async_client())  # noqa: SLF001
+        backend._async_client = AsyncKosa8Client(api_key=cloud.api_key, http_client=cloud.async_client(), files_root=ws)
         try:
             yield backend
         finally:
-            backend.delete()
+            backend.delete_sandbox()
