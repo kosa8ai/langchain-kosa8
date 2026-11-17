@@ -323,12 +323,12 @@ def test_upload_and_download_over_8_mib(tmp_path: Path) -> None:
     before = cloud.exec_count
     assert k.upload(client, session, sid, str(target), data) is None
     assert target.read_bytes() == data
-    assert cloud.exec_count - before == 1  # the join
+    assert cloud.exec_count - before == 1  # the install as the sandbox user
     assert sorted(p.name for p in target.parent.iterdir()) == ["data.bin"]
     before = cloud.exec_count
     got = k.download(client, session, sid, str(target))
     assert got.error is None and got.content == data
-    assert cloud.exec_count - before == 2  # split, then remove the parts
+    assert cloud.exec_count - before == 2  # check and split, then remove the parts
     assert not list((tmp_path / "workspace" / ".kosa8-run").iterdir())
     assert k.download(client, session, sid, str(target), max_bytes=1024).error == "too_large"
 
@@ -347,11 +347,60 @@ async def test_async_large_upload_and_download(tmp_path: Path) -> None:
     assert out.stdout.strip() == str(len(data))
 
 
-def test_outside_the_files_root_uses_exec(tmp_path: Path) -> None:
+def test_outside_the_files_root_is_staged_and_installed(tmp_path: Path) -> None:
     cloud, client, session, sid = _files_client(tmp_path)
     other = tmp_path / "elsewhere" / "f.bin"
-    assert k.upload(client, session, sid, str(other), b"abc") is None
-    assert other.read_bytes() == b"abc" and _puts(cloud) == []
+    data = os.urandom(300_000)
+    assert k.upload(client, session, sid, str(other), data) is None
+    assert other.read_bytes() == data
+    assert all("/.kosa8-run/" in p for p in _puts(cloud))
+    assert k.download(client, session, sid, str(other)).content == data
+    assert not list((tmp_path / "workspace" / ".kosa8-run").iterdir())
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores permission bits")
+def test_permissions_are_checked_as_the_sandbox_user(tmp_path: Path) -> None:
+    """The files API ignores permissions (the fake does too), so writes and
+    reads must still be refused when the sandbox user could not make them."""
+    cloud, client, session, sid = _files_client(tmp_path)
+    ws = tmp_path / "workspace"
+    ro = ws / "ro.txt"
+    ro.write_bytes(b"keep")
+    ro.chmod(0o444)
+    hidden = ws / "hidden.txt"
+    hidden.write_bytes(b"secret")
+    hidden.chmod(0o000)
+    locked = ws / "locked"
+    locked.mkdir()
+    locked.chmod(0o555)
+    try:
+        assert k.upload(client, session, sid, str(ro), b"new") == "permission_denied"
+        assert ro.read_bytes() == b"keep"
+        assert k.upload(client, session, sid, str(locked / "x.txt"), b"new") == "permission_denied"
+        assert not (locked / "x.txt").exists()
+        assert k.download(client, session, sid, str(hidden)).error == "permission_denied"
+        assert k.upload(client, session, sid, str(ws), b"x") == "is_directory"
+        assert k.download(client, session, sid, str(ws / "nope")).error == "file_not_found"
+        assert not list((ws / ".kosa8-run").iterdir())  # refused writes leave no staged parts
+    finally:
+        hidden.chmod(0o600)
+        locked.chmod(0o755)
+
+
+def test_overwrite_keeps_mode_and_writes_through_symlinks(tmp_path: Path) -> None:
+    cloud, client, session, sid = _files_client(tmp_path)
+    ws = tmp_path / "workspace"
+    script = ws / "run.sh"
+    script.write_bytes(b"old")
+    script.chmod(0o755)
+    assert k.upload(client, session, sid, str(script), b"#!/bin/sh\necho hi\n") is None
+    assert script.stat().st_mode & 0o777 == 0o755
+    link = ws / "link.txt"
+    link.symlink_to(script)
+    assert k.upload(client, session, sid, str(link), b"through") is None
+    assert link.is_symlink() and script.read_bytes() == b"through"
+    assert k.upload(client, session, sid, str(ws / "empty.txt"), b"") is None
+    assert (ws / "empty.txt").read_bytes() == b""
 
 
 def test_files_api_failure_falls_back_to_exec_and_cleans_parts(tmp_path: Path) -> None:
@@ -371,4 +420,4 @@ def test_files_api_failure_falls_back_to_exec_and_cleans_parts(tmp_path: Path) -
     data = os.urandom(9 * 1024 * 1024)
     assert k.upload(client, session, sid, str(target), data) is None
     assert target.read_bytes() == data
-    assert sorted(p.name for p in target.parent.iterdir()) == ["x.bin"]  # no part files left
+    assert not list((tmp_path / "workspace" / ".kosa8-run").iterdir())  # no part files left

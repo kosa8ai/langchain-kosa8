@@ -26,13 +26,19 @@ How commands run on kosa8 Cloud, and what this module does about it:
   the answer is 504 ``exec_timeout``. A streamed exec (NDJSON frames) has no
   such limit and ends with a frame ``{done, error, code: exec_timeout}`` when
   its ``timeout_s`` runs out. Streamed exec is used when the host offers it.
-* Files under ``/workspace`` go through the files API, at most 8 MiB per
-  request: a larger file is sent as numbered parts that one exec joins, and
-  read back as parts that one exec splits it into. A command or stdin too
-  large for one exec request is staged the same way. Anything else (other
-  paths, hosts without the files API, and every error, so that it is
-  reported precisely) goes through exec: the bytes travel base64-encoded,
-  in chunks sized to the API's request (64 KiB) and output (1 MiB) limits.
+* File bytes travel through the files API (``/workspace`` only, at most
+  8 MiB per request), but the files API acts with host privileges and
+  ignores the sandbox user's permissions. So a write is staged in the
+  workspace's ``.kosa8-run`` and moved into place by one exec as the
+  sandbox user (``cat parts > target``: permissions are checked, an
+  existing file keeps its mode and owner, symlinks are written through);
+  a read is checked by one exec as the sandbox user, which also splits a
+  file over 8 MiB (or outside ``/workspace``) into staged parts, before the
+  bytes are fetched. A command or stdin too large for one exec request is
+  staged in ``.kosa8-run`` directly. Without the files API, and on errors
+  that exec reports more precisely, the bytes go through exec instead,
+  base64-encoded, in chunks sized to the API's request (64 KiB) and output
+  (1 MiB) limits.
 * There is no stdin, user or working-directory field in the exec API; this
   module provides stdin, working directory and timeouts with a small POSIX
   shell wrapper. Commands run as the image's default user. Each argv entry
@@ -151,6 +157,9 @@ class UploadRequest:
 
     path: str
     data: bytes
+    #: True for the transport's own staging files (written as they are);
+    #: False for a caller's file, which is moved into place as the sandbox user.
+    direct: bool = False
 
 
 #: A driver's answer to an UploadRequest it did not carry.
@@ -909,49 +918,62 @@ def persist_prelude(persist_dirs: Sequence[str], workspace: str) -> str:
 T = TypeVar("T")
 Op = Generator["ExecRequest | UploadRequest", Any, T]
 
-# $1 target, then the part files: join them into the target and remove them.
-_JOIN_SCRIPT = (
+# $1 target, then the staged part files: write them, in order, into the
+# target as the sandbox user and remove them. With no parts the target is
+# made empty. Errors go to stderr as K8ERR:<code>.
+_INSTALL_SCRIPT = (
     't=$1; shift; '
     '[ -d "$t" ] && { rm -f "$@"; echo K8ERR:is_directory >&2; exit 21; }; '
+    'dir=${t%/*}; [ -z "$dir" ] && dir=/; '
+    'if [ ! -d "$dir" ]; then mkdir -p "$dir" 2>/dev/null || { rm -f "$@"; '
+    'if [ -e "$dir" ]; then echo K8ERR:invalid_path >&2; else echo K8ERR:permission_denied >&2; fi; exit 22; }; fi; '
+    '( : >> "$t" ) 2>/dev/null || { rm -f "$@"; echo K8ERR:permission_denied >&2; exit 23; }; '
+    'if [ "$#" = 0 ]; then : > "$t"; exit 0; fi; '
     'cat "$@" > "$t" 2>/dev/null; r=$?; rm -f "$@"; '
     '[ "$r" = 0 ] || { echo K8ERR:write_failed >&2; exit 25; }'
 )
 
-# $1 file, $2 part size, $3 part prefix: split the file into numbered parts
-# ($3.0, $3.1, ...) and print "<size> <parts>".
-_SPLIT_SCRIPT = (
-    'p=$1; b=$2; o=$3; z=$(wc -c < "$p") || exit 1; n=0; '
+# $1 file, $2 part size, $3 part prefix, $4 max bytes (or empty), $5 1 to
+# always split. Checks the file as the sandbox user and prints
+# "K8:<status> <size> <parts>"; a file over $2 bytes (or any, with $5) is
+# split into $3.0, $3.1, ... for the files API to read.
+_READ_SCRIPT = (
+    'p=$1; b=$2; o=$3; mx=$4; '
+    'if [ -d "$p" ]; then echo K8:is_directory; exit 0; fi; '
+    'if [ ! -e "$p" ]; then echo K8:file_not_found; exit 0; fi; '
+    'if [ ! -r "$p" ]; then echo K8:permission_denied; exit 0; fi; '
+    'z=$(wc -c < "$p" 2>/dev/null) || { echo K8:permission_denied; exit 0; }; z=$((z + 0)); '
+    'if [ -n "$mx" ] && [ "$z" -gt "$mx" ]; then echo K8:too_large; exit 0; fi; '
+    'n=0; if [ "$z" -gt "$b" ] || [ "$5" = 1 ]; then mkdir -p "${o%/*}" || exit 1; '
     'while [ $((n * b)) -lt "$z" ]; do '
-    'dd if="$p" of="$o.$n" bs="$b" skip="$n" count=1 2>/dev/null || { rm -f "$o".*; exit 1; }; n=$((n + 1)); done; '
-    'echo "$z $n"'
+    'dd if="$p" of="$o.$n" bs="$b" skip="$n" count=1 2>/dev/null || { rm -f "$o".*; exit 1; }; n=$((n + 1)); done; fi; '
+    'echo "K8:ok $z $n"'
 )
 
 
-def drive(
-    op: Op[T], send: Callable[[ExecRequest], ExecOutput], put: Callable[[str, bytes], Any] | None = None
-) -> T:
+def drive(op: Op[T], send: Callable[[ExecRequest], ExecOutput], put: Callable[[UploadRequest], Any] | None = None) -> T:
     """Run an operation, sending each exec request it yields synchronously.
 
-    ``put(path, data)`` carries its file writes (see :func:`files_put`);
+    ``put(request)`` carries its file writes (see :func:`files_put`);
     without it they go through exec."""
     try:
         req = next(op)
         while True:
             if isinstance(req, UploadRequest):
-                req = op.send(put(req.path, req.data) if put is not None else FALLBACK)
+                req = op.send(put(req) if put is not None else FALLBACK)
             else:
                 req = op.send(send(req))
     except StopIteration as stop:
         return stop.value
 
 
-async def adrive(op: Op[T], send: Callable[[ExecRequest], Any], put: Callable[[str, bytes], Any] | None = None) -> T:
+async def adrive(op: Op[T], send: Callable[[ExecRequest], Any], put: Callable[[UploadRequest], Any] | None = None) -> T:
     """Run an operation, awaiting each exec request it yields (and ``put``, as :func:`drive`)."""
     try:
         req = next(op)
         while True:
             if isinstance(req, UploadRequest):
-                req = op.send(await put(req.path, req.data) if put is not None else FALLBACK)
+                req = op.send(await put(req) if put is not None else FALLBACK)
             else:
                 req = op.send(await send(req))
     except StopIteration as stop:
@@ -978,37 +1000,61 @@ def _files_api_fallback(client: Kosa8Client | AsyncKosa8Client, err: Kosa8Error)
     return err.status is not None and err.status not in (401, 402, 403, 429)
 
 
-def _parts(path: str, data: bytes) -> list[tuple[str, bytes]]:
+def _parts(base: str, data: bytes) -> list[tuple[str, bytes]]:
     step = MAX_FILES_API_BYTES
-    return [(f"{path}.k8part{i}", data[off : off + step]) for i, off in enumerate(range(0, len(data), step))]
+    return [(f"{base}.k8part{i}", data[off : off + step]) for i, off in enumerate(range(0, len(data), step))]
 
 
-def files_put(client: Kosa8Client, session: SandboxSession, sandbox_id: str) -> Callable[[str, bytes], Any]:
-    """A ``put`` for :func:`drive` that writes files under the client's
-    files_root through the files API (in parts past 8 MiB). It answers
-    FALLBACK for other paths and for errors exec reports better."""
+def _put_plan(
+    client: Kosa8Client | AsyncKosa8Client, session: SandboxSession, req: UploadRequest
+) -> tuple[str, list[tuple[str, bytes]], bool] | None:
+    """How the files API carries one write: (directory to make, files to PUT,
+    whether one exec then installs them into ``req.path``), or None for exec.
 
-    def put(path: str, data: bytes) -> Any:
-        if not _files_api_path(client, path):
+    The transport's own staging files under files_root are written as they
+    are (joined by an exec only past 8 MiB). A caller's file is always staged
+    in the spill directory and installed as the sandbox user, because the
+    files API ignores permissions."""
+    if req.direct:
+        if not _files_api_path(client, req.path):
+            return None
+        if len(req.data) <= MAX_FILES_API_BYTES:
+            return posixpath.dirname(req.path), [(req.path, req.data)], False
+        return posixpath.dirname(req.path), _parts(req.path, req.data), True
+    spill = session._spill_dir()
+    if not _files_api_path(client, spill):
+        return None
+    return spill, _parts(f"{spill}/up-{uuid.uuid4().hex}", req.data), True
+
+
+def files_put(client: Kosa8Client, session: SandboxSession, sandbox_id: str) -> Callable[[UploadRequest], Any]:
+    """A ``put`` for :func:`drive` that carries writes through the files API
+    (see :func:`_put_plan`). It answers FALLBACK when exec should write the
+    file instead: no files API, a spill directory outside it, or an error
+    that exec reports better."""
+
+    def put(req: UploadRequest) -> Any:
+        plan = _put_plan(client, session, req)
+        if plan is None:
             return FALLBACK
-        parts: list[tuple[str, bytes]] = []
+        folder, files, install = plan
+        sent: list[str] = []
         try:
-            parent = posixpath.dirname(path)
-            if parent != client.files_root:
-                client.make_dir(sandbox_id, parent)
-            if len(data) <= MAX_FILES_API_BYTES:
-                client.put_file(sandbox_id, path, data)
-                return None
-            for name, part in _parts(path, data):
-                parts.append((name, part))
+            if files and folder != client.files_root:
+                client.make_dir(sandbox_id, folder)
+            for name, part in files:
+                sent.append(name)
                 client.put_file(sandbox_id, name, part)
-            out = client.exec(sandbox_id, session._sh(_JOIN_SCRIPT, path, *(n for n, _ in parts)))
-            parts = []
+            if not install:
+                return None
+            names = [n for n, _ in files]
+            sent = []
+            out = client.exec(sandbox_id, session._sh(_INSTALL_SCRIPT, req.path, *names))
             return None if out.exit_code == 0 else _upload_error(out)
         except Kosa8Error as e:
-            if parts:  # leave no part files behind
+            if sent and install:  # leave no staged parts behind
                 try:
-                    client.exec(sandbox_id, session._sh('rm -f "$@"', *(n for n, _ in parts)))
+                    client.exec(sandbox_id, session._sh('rm -f "$@"', *sent))
                 except Kosa8Error:
                     pass
             if not _files_api_fallback(client, e):
@@ -1018,30 +1064,31 @@ def files_put(client: Kosa8Client, session: SandboxSession, sandbox_id: str) -> 
     return put
 
 
-def afiles_put(client: AsyncKosa8Client, session: SandboxSession, sandbox_id: str) -> Callable[[str, bytes], Any]:
+def afiles_put(client: AsyncKosa8Client, session: SandboxSession, sandbox_id: str) -> Callable[[UploadRequest], Any]:
     """The asynchronous twin of :func:`files_put`."""
 
-    async def put(path: str, data: bytes) -> Any:
-        if not _files_api_path(client, path):
+    async def put(req: UploadRequest) -> Any:
+        plan = _put_plan(client, session, req)
+        if plan is None:
             return FALLBACK
-        parts: list[tuple[str, bytes]] = []
+        folder, files, install = plan
+        sent: list[str] = []
         try:
-            parent = posixpath.dirname(path)
-            if parent != client.files_root:
-                await client.make_dir(sandbox_id, parent)
-            if len(data) <= MAX_FILES_API_BYTES:
-                await client.put_file(sandbox_id, path, data)
-                return None
-            for name, part in _parts(path, data):
-                parts.append((name, part))
+            if files and folder != client.files_root:
+                await client.make_dir(sandbox_id, folder)
+            for name, part in files:
+                sent.append(name)
                 await client.put_file(sandbox_id, name, part)
-            out = await client.exec(sandbox_id, session._sh(_JOIN_SCRIPT, path, *(n for n, _ in parts)))
-            parts = []
+            if not install:
+                return None
+            names = [n for n, _ in files]
+            sent = []
+            out = await client.exec(sandbox_id, session._sh(_INSTALL_SCRIPT, req.path, *names))
             return None if out.exit_code == 0 else _upload_error(out)
         except Kosa8Error as e:
-            if parts:
+            if sent and install:
                 try:
-                    await client.exec(sandbox_id, session._sh('rm -f "$@"', *(n for n, _ in parts)))
+                    await client.exec(sandbox_id, session._sh('rm -f "$@"', *sent))
                 except Kosa8Error:
                     pass
             if not _files_api_fallback(client, e):
@@ -1052,8 +1099,9 @@ def afiles_put(client: AsyncKosa8Client, session: SandboxSession, sandbox_id: st
 
 
 def upload(client: Kosa8Client, session: SandboxSession, sandbox_id: str, path: str, data: bytes) -> str | None:
-    """Write ``data`` to the absolute ``path`` in the sandbox, creating parent
-    directories. Returns None, or an error code as ``SandboxSession.upload_op``."""
+    """Write ``data`` to the absolute ``path`` in the sandbox as the sandbox
+    user, creating parent directories. Returns None, or an error code as
+    ``SandboxSession.upload_op``."""
     return drive(session.upload_op(path, data), lambda req: client.exec(sandbox_id, req), files_put(client, session, sandbox_id))
 
 
@@ -1064,41 +1112,56 @@ async def aupload(client: AsyncKosa8Client, session: SandboxSession, sandbox_id:
     )
 
 
-def _split_parts(out: ExecOutput, prefix: str) -> list[str] | None:
-    """The part files a split answered, or None when it failed."""
-    try:
-        _, n = out.stdout.split()
-        return [f"{prefix}.{i}" for i in range(int(n))] if out.exit_code == 0 else None
-    except ValueError:
+def _read_request(
+    client: Kosa8Client | AsyncKosa8Client, session: SandboxSession, path: str, max_bytes: int | None
+) -> tuple[ExecRequest, str] | None:
+    """The exec that checks (and if needed splits) a file before the files API
+    reads it, and the prefix of its parts; None when exec must read it."""
+    spill = session._spill_dir()
+    if not path.startswith("/") or not _files_api_path(client, spill):
         return None
+    prefix = f"{spill}/dl-{uuid.uuid4().hex}"
+    always_split = "0" if _files_api_path(client, path) else "1"
+    mx = "" if max_bytes is None else str(max_bytes)
+    return session._sh(_READ_SCRIPT, path, str(MAX_FILES_API_BYTES), prefix, mx, always_split), prefix
+
+
+def _read_status(out: ExecOutput) -> tuple[str, int]:
+    """(status, parts) from the read check: status is ok or an error code."""
+    head = (out.stdout or "").strip().split()
+    if out.exit_code != 0 or not head or not head[0].startswith("K8:"):
+        return "error", 0
+    status = head[0][3:]
+    if status != "ok":
+        return status, 0
+    try:
+        return "ok", int(head[2])
+    except (IndexError, ValueError):
+        return "error", 0
 
 
 def download(client: Kosa8Client, session: SandboxSession, sandbox_id: str, path: str, max_bytes: int | None = None) -> DownloadResult:
-    """Read the absolute ``path`` from the sandbox; errors as ``SandboxSession.download_op``.
-    Under files_root it goes through the files API, a file over 8 MiB as parts."""
-    if _files_api_path(client, path):
-        try:
-            data = client.get_file(sandbox_id, path)
-            if max_bytes is not None and len(data) > max_bytes:
-                return DownloadResult(None, "too_large")
-            return DownloadResult(data)
-        except Kosa8Error as e:
-            if e.status == 413 and (max_bytes is None or max_bytes > MAX_FILES_API_BYTES):
-                prefix = f"{session._spill_dir()}/dl-{uuid.uuid4().hex}"
-                if _files_api_path(client, prefix):
-                    client.make_dir(sandbox_id, session._spill_dir())
-                    out = client.exec(sandbox_id, session._sh(_SPLIT_SCRIPT, path, str(MAX_FILES_API_BYTES), prefix))
-                    parts = _split_parts(out, prefix)
-                    if parts is not None:
-                        try:
-                            data = b"".join(client.get_file(sandbox_id, name) for name in parts)
-                        finally:
-                            client.exec(sandbox_id, session._sh('rm -f "$@"', *parts))
-                        if max_bytes is not None and len(data) > max_bytes:
-                            return DownloadResult(None, "too_large")
-                        return DownloadResult(data)
-            elif not _files_api_fallback(client, e):
-                raise
+    """Read the absolute ``path`` as the sandbox user; errors as
+    ``SandboxSession.download_op``. One exec checks the file (and splits one
+    over 8 MiB, or outside files_root, into staged parts); the files API
+    carries the bytes."""
+    plan = _read_request(client, session, path, max_bytes) if client.files_api is not False else None
+    if plan is not None:
+        check, prefix = plan
+        status, n = _read_status(client.exec(sandbox_id, check))
+        if status not in ("ok", "error"):
+            return DownloadResult(None, status)
+        if status == "ok":
+            names = [f"{prefix}.{i}" for i in range(n)]
+            try:
+                data = b"".join(client.get_file(sandbox_id, name) for name in names) if names else client.get_file(sandbox_id, path)
+                return DownloadResult(data)
+            except Kosa8Error as e:
+                if not _files_api_fallback(client, e):
+                    raise
+            finally:
+                if names:
+                    client.exec(sandbox_id, session._sh('rm -f "$@"', *names))
     return drive(session.download_op(path, max_bytes), lambda req: client.exec(sandbox_id, req))
 
 
@@ -1106,29 +1169,26 @@ async def adownload(
     client: AsyncKosa8Client, session: SandboxSession, sandbox_id: str, path: str, max_bytes: int | None = None
 ) -> DownloadResult:
     """The asynchronous twin of :func:`download`."""
-    if _files_api_path(client, path):
-        try:
-            data = await client.get_file(sandbox_id, path)
-            if max_bytes is not None and len(data) > max_bytes:
-                return DownloadResult(None, "too_large")
-            return DownloadResult(data)
-        except Kosa8Error as e:
-            if e.status == 413 and (max_bytes is None or max_bytes > MAX_FILES_API_BYTES):
-                prefix = f"{session._spill_dir()}/dl-{uuid.uuid4().hex}"
-                if _files_api_path(client, prefix):
-                    await client.make_dir(sandbox_id, session._spill_dir())
-                    out = await client.exec(sandbox_id, session._sh(_SPLIT_SCRIPT, path, str(MAX_FILES_API_BYTES), prefix))
-                    parts = _split_parts(out, prefix)
-                    if parts is not None:
-                        try:
-                            data = b"".join([await client.get_file(sandbox_id, name) for name in parts])
-                        finally:
-                            await client.exec(sandbox_id, session._sh('rm -f "$@"', *parts))
-                        if max_bytes is not None and len(data) > max_bytes:
-                            return DownloadResult(None, "too_large")
-                        return DownloadResult(data)
-            elif not _files_api_fallback(client, e):
-                raise
+    plan = _read_request(client, session, path, max_bytes) if client.files_api is not False else None
+    if plan is not None:
+        check, prefix = plan
+        status, n = _read_status(await client.exec(sandbox_id, check))
+        if status not in ("ok", "error"):
+            return DownloadResult(None, status)
+        if status == "ok":
+            names = [f"{prefix}.{i}" for i in range(n)]
+            try:
+                if names:
+                    data = b"".join([await client.get_file(sandbox_id, name) for name in names])
+                else:
+                    data = await client.get_file(sandbox_id, path)
+                return DownloadResult(data)
+            except Kosa8Error as e:
+                if not _files_api_fallback(client, e):
+                    raise
+            finally:
+                if names:
+                    await client.exec(sandbox_id, session._sh('rm -f "$@"', *names))
     return await adrive(session.download_op(path, max_bytes), lambda req: client.exec(sandbox_id, req))
 
 
@@ -1197,8 +1257,8 @@ class SandboxSession:
             return _const("invalid_path")
         return self._upload_gen(path, data)
 
-    def _upload_gen(self, path: str, data: bytes) -> Op[str | None]:
-        done = yield UploadRequest(path, data)
+    def _upload_gen(self, path: str, data: bytes, direct: bool = False) -> Op[str | None]:
+        done = yield UploadRequest(path, data, direct)
         if done is not FALLBACK:
             return done
         step = max(1, self.upload_chunk_bytes)
@@ -1308,14 +1368,14 @@ class SandboxSession:
         spill = self._spill_dir()
         if size() > self.body_limit and "K8_STDIN" in k8:
             name = f"{spill}/stdin-{uuid.uuid4().hex}"
-            err = yield from self._upload_gen(name, stdin or b"")
+            err = yield from self._upload_gen(name, stdin or b"", direct=True)
             if err:
                 raise Kosa8Error(f"could not pass stdin to the command: {err}")
             del k8["K8_STDIN"]
             k8["K8_STDINFILE"] = name
         if size() > self.body_limit:
             name = f"{spill}/cmd-{uuid.uuid4().hex}"
-            err = yield from self._upload_gen(name, command.encode("utf-8"))
+            err = yield from self._upload_gen(name, command.encode("utf-8"), direct=True)
             if err:
                 raise Kosa8Error(f"could not pass the command to the sandbox: {err}")
             del k8["K8_CMD"]

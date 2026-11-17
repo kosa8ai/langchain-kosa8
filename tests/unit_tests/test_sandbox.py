@@ -154,10 +154,11 @@ def test_files_api_carries_workspace_files(cloud: FakeCloud, backend: Kosa8Sandb
     assert backend.upload_files([(path, b"hi")])[0].error is None
     assert backend.download_files([path])[0].content == b"hi"
     if cloud.files_api:
-        assert cloud.exec_count == execs and _files_calls(cloud) == 3
+        # mkdir + PUT + GET, with one exec to install the write and one to check the read, as the sandbox user.
+        assert cloud.exec_count == execs + 2 and _files_calls(cloud) == 3
     else:
         assert _files_calls(cloud) == 1  # one 501, then exec only
-    # Errors are reported as Deep Agents' codes, through exec.
+    # Errors are reported as Deep Agents' codes.
     assert backend.download_files([str(tmp_path / "missing")])[0].error == "file_not_found"
     assert backend.upload_files([(str(tmp_path / "a"), b"x")])[0].error == "is_directory"
 

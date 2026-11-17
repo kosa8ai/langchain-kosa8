@@ -14,12 +14,13 @@ Nothing here talks to the network.
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import os
 import signal
 import subprocess
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -74,6 +75,9 @@ class FakeCloud:
     #: Whether the files API is offered (False answers 501), and the folder it reaches.
     files_api: bool = True
     files_root: str = "/workspace"
+    #: The real files API acts with host privileges, so it ignores the
+    #: sandbox user's permissions: the fake does the same.
+    files_api_ignores_permissions: bool = True
     #: Whether a streamed exec takes timeout_s (False answers 501, as older hosts do).
     stream_timeout: bool = True
     #: Polls of GET before a create that answered ``creating`` runs.
@@ -166,12 +170,14 @@ class FakeCloud:
             if len(parts) == 4 and method == "PUT":
                 if len(body) > 8 * 1024 * 1024:
                     return _err(413, "too_large", "one file is at most 8388608 bytes through the API")
-                with open(p, "wb") as f:
-                    f.write(body)
+                with self._privileged(p, os.W_OK):
+                    with open(p, "wb") as f:
+                        f.write(body)
                 return _json(200, {"file": {"path": p, "size": len(body)}})
             if len(parts) == 4 and method == "GET":
-                with open(p, "rb") as f:
-                    data = f.read()
+                with self._privileged(p, os.R_OK):
+                    with open(p, "rb") as f:
+                        data = f.read()
                 if len(data) > 8 * 1024 * 1024:
                     return _err(413, "too_large", "one file is at most 8388608 bytes through the API")
                 return httpx.Response(200, content=data, headers={"content-type": "application/octet-stream"})
@@ -184,6 +190,23 @@ class FakeCloud:
         except PermissionError:
             return _err(502, "host_failed", f"could not use {p}: permission denied")
         return _err(404, "not_found", "no such route")
+
+    @contextlib.contextmanager
+    def _privileged(self, path: str, want: int) -> Iterator[None]:
+        """Lift the file's (and its folder's) permission bits for one call, as
+        a host with privileges would not need to, then put them back."""
+        saved: list[tuple[str, int]] = []
+        if self.files_api_ignores_permissions:
+            for target, need in ((os.path.dirname(path), os.W_OK | os.X_OK if want == os.W_OK else os.X_OK), (path, want)):
+                if os.path.exists(target) and not os.access(target, need):
+                    mode = os.stat(target).st_mode & 0o7777
+                    saved.append((target, mode))
+                    os.chmod(target, mode | (0o700 if os.path.isdir(target) else 0o600))
+        try:
+            yield
+        finally:
+            for target, mode in reversed(saved):
+                os.chmod(target, mode)
 
     # Endpoints ---------------------------------------------------------------
 
