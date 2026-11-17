@@ -26,9 +26,11 @@ from langchain_kosa8._kosa8 import (
     SandboxSession,
     adownload,
     adrive,
+    afiles_put,
     aupload,
     download,
     drive,
+    files_put,
     upload,
 )
 
@@ -236,7 +238,7 @@ class Kosa8Sandbox(BaseSandbox):
         t = self._effective_timeout(timeout)
         op = self._session.command_op(command, timeout=t)
         try:
-            out = drive(op, lambda req: self.client.exec(self._sandbox_id, req))
+            out = drive(op, lambda req: self.client.exec(self._sandbox_id, req), files_put(self.client, self._session, self._sandbox_id))
         except Kosa8TimeoutError:
             return _timeout_response(None, reason=_HOST_LIMIT_REASON)
         return self._response(out, t)
@@ -246,7 +248,11 @@ class Kosa8Sandbox(BaseSandbox):
         t = self._effective_timeout(timeout)
         op = self._session.command_op(command, timeout=t)
         try:
-            out = await adrive(op, lambda req: self.async_client.exec(self._sandbox_id, req))
+            out = await adrive(
+                op,
+                lambda req: self.async_client.exec(self._sandbox_id, req),
+                afiles_put(self.async_client, self._session, self._sandbox_id),
+            )
         except Kosa8TimeoutError:
             return _timeout_response(None, reason=_HOST_LIMIT_REASON)
         return self._response(out, t)
