@@ -30,7 +30,7 @@ def session(tmp_path: Path) -> k.SandboxSession:
     return k.SandboxSession(workspace=str(ws), persist_dirs=())
 
 
-def run(client: k.Kosa8Client, sid: str, op):  # noqa: ANN001, ANN202
+def run(client: k.Kosa8Client, sid: str, op):
     return k.drive(op, lambda req: client.exec(sid, req))
 
 
@@ -279,3 +279,145 @@ def test_in_a_linux_container_with_default_settings() -> None:
     assert kept.stdout.strip() == "data.bin"
     out = run(client, sid, sess.command_op("pwd; cat", stdin=b"in"))
     assert out.stdout == "/workspace\nin"
+
+
+# Files API: large stdin, uploads and downloads travel in 8 MiB parts --------
+
+
+def _files_client(tmp_path: Path) -> tuple[FakeCloud, k.Kosa8Client, k.SandboxSession, str]:
+    ws = tmp_path / "workspace"
+    ws.mkdir(exist_ok=True)
+    cloud = FakeCloud(files_root=str(ws))
+    client = k.Kosa8Client(api_key=cloud.api_key, http_client=cloud.client(), files_root=str(ws))
+    return cloud, client, k.SandboxSession(workspace=str(ws), persist_dirs=()), client.create_sandbox()["id"]
+
+
+def _puts(cloud: FakeCloud) -> list[str]:
+    return [b["path"] for (m, p, b) in cloud.requests if m == "PUT" and p.endswith("/files")]
+
+
+def test_large_stdin_goes_through_the_files_api_in_parts(tmp_path: Path) -> None:
+    cloud, client, session, sid = _files_client(tmp_path)
+    data = os.urandom(20 * 1024 * 1024 + 123)
+    before = cloud.exec_count
+    out = k.drive(session.command_op("wc -c", stdin=data), lambda req: client.exec(sid, req), k.files_put(client, session, sid))
+    assert out.stdout.strip() == str(len(data))
+    puts = _puts(cloud)
+    assert len(puts) == 3 and all(".k8part" in p for p in puts)  # 8 + 8 + 4 MiB
+    assert cloud.exec_count - before == 2  # one join, one command: not ~800 env chunks
+    assert not list((tmp_path / "workspace" / ".kosa8-run").iterdir())  # parts and spill removed
+
+
+def test_large_command_goes_through_the_files_api(tmp_path: Path) -> None:
+    cloud, client, session, sid = _files_client(tmp_path)
+    big = "y" * 200_000
+    out = k.drive(session.command_op(f"printf %s '{big}' | wc -c"), lambda req: client.exec(sid, req), k.files_put(client, session, sid))
+    assert out.stdout.strip() == "200000"
+    assert len(_puts(cloud)) == 1
+
+
+def test_upload_and_download_over_8_mib(tmp_path: Path) -> None:
+    cloud, client, session, sid = _files_client(tmp_path)
+    target = tmp_path / "workspace" / "big" / "data.bin"
+    data = os.urandom(17 * 1024 * 1024)
+    before = cloud.exec_count
+    assert k.upload(client, session, sid, str(target), data) is None
+    assert target.read_bytes() == data
+    assert cloud.exec_count - before == 1  # the install as the sandbox user
+    assert sorted(p.name for p in target.parent.iterdir()) == ["data.bin"]
+    before = cloud.exec_count
+    got = k.download(client, session, sid, str(target))
+    assert got.error is None and got.content == data
+    assert cloud.exec_count - before == 2  # check and split, then remove the parts
+    assert not list((tmp_path / "workspace" / ".kosa8-run").iterdir())
+    assert k.download(client, session, sid, str(target), max_bytes=1024).error == "too_large"
+
+
+async def test_async_large_upload_and_download(tmp_path: Path) -> None:
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    cloud = FakeCloud(files_root=str(ws))
+    client = k.AsyncKosa8Client(api_key=cloud.api_key, http_client=cloud.async_client(), files_root=str(ws))
+    session = k.SandboxSession(workspace=str(ws), persist_dirs=())
+    sid = (await client.create_sandbox())["id"]
+    data = os.urandom(9 * 1024 * 1024)
+    assert await k.aupload(client, session, sid, str(ws / "d.bin"), data) is None
+    assert (await k.adownload(client, session, sid, str(ws / "d.bin"))).content == data
+    out = await k.adrive(session.command_op("wc -c", stdin=data), lambda req: client.exec(sid, req), k.afiles_put(client, session, sid))
+    assert out.stdout.strip() == str(len(data))
+
+
+def test_outside_the_files_root_is_staged_and_installed(tmp_path: Path) -> None:
+    cloud, client, session, sid = _files_client(tmp_path)
+    other = tmp_path / "elsewhere" / "f.bin"
+    data = os.urandom(300_000)
+    assert k.upload(client, session, sid, str(other), data) is None
+    assert other.read_bytes() == data
+    assert all("/.kosa8-run/" in p for p in _puts(cloud))
+    assert k.download(client, session, sid, str(other)).content == data
+    assert not list((tmp_path / "workspace" / ".kosa8-run").iterdir())
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores permission bits")
+def test_permissions_are_checked_as_the_sandbox_user(tmp_path: Path) -> None:
+    """The files API ignores permissions (the fake does too), so writes and
+    reads must still be refused when the sandbox user could not make them."""
+    cloud, client, session, sid = _files_client(tmp_path)
+    ws = tmp_path / "workspace"
+    ro = ws / "ro.txt"
+    ro.write_bytes(b"keep")
+    ro.chmod(0o444)
+    hidden = ws / "hidden.txt"
+    hidden.write_bytes(b"secret")
+    hidden.chmod(0o000)
+    locked = ws / "locked"
+    locked.mkdir()
+    locked.chmod(0o555)
+    try:
+        assert k.upload(client, session, sid, str(ro), b"new") == "permission_denied"
+        assert ro.read_bytes() == b"keep"
+        assert k.upload(client, session, sid, str(locked / "x.txt"), b"new") == "permission_denied"
+        assert not (locked / "x.txt").exists()
+        assert k.download(client, session, sid, str(hidden)).error == "permission_denied"
+        assert k.upload(client, session, sid, str(ws), b"x") == "is_directory"
+        assert k.download(client, session, sid, str(ws / "nope")).error == "file_not_found"
+        assert not list((ws / ".kosa8-run").iterdir())  # refused writes leave no staged parts
+    finally:
+        hidden.chmod(0o600)
+        locked.chmod(0o755)
+
+
+def test_overwrite_keeps_mode_and_writes_through_symlinks(tmp_path: Path) -> None:
+    cloud, client, session, sid = _files_client(tmp_path)
+    ws = tmp_path / "workspace"
+    script = ws / "run.sh"
+    script.write_bytes(b"old")
+    script.chmod(0o755)
+    assert k.upload(client, session, sid, str(script), b"#!/bin/sh\necho hi\n") is None
+    assert script.stat().st_mode & 0o777 == 0o755
+    link = ws / "link.txt"
+    link.symlink_to(script)
+    assert k.upload(client, session, sid, str(link), b"through") is None
+    assert link.is_symlink() and script.read_bytes() == b"through"
+    assert k.upload(client, session, sid, str(ws / "empty.txt"), b"") is None
+    assert (ws / "empty.txt").read_bytes() == b""
+
+
+def test_files_api_failure_falls_back_to_exec_and_cleans_parts(tmp_path: Path) -> None:
+    cloud, client, session, sid = _files_client(tmp_path)
+    original = cloud._files
+    calls = {"n": 0}
+
+    def flaky(parts, method, request, body):  # type: ignore[no-untyped-def]
+        if method == "PUT":
+            calls["n"] += 1
+            if calls["n"] == 2:
+                return httpx.Response(502, json={"error": "host_failed", "message": "boom"})
+        return original(parts, method, request, body)
+
+    cloud._files = flaky  # type: ignore[method-assign]
+    target = tmp_path / "workspace" / "x.bin"
+    data = os.urandom(9 * 1024 * 1024)
+    assert k.upload(client, session, sid, str(target), data) is None
+    assert target.read_bytes() == data
+    assert not list((tmp_path / "workspace" / ".kosa8-run").iterdir())  # no part files left

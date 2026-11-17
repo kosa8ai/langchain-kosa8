@@ -14,17 +14,19 @@ from langchain_kosa8 import AsyncKosa8Client, Kosa8Client, Kosa8Sandbox
 from tests.fake_cloud import FakeCloud
 
 
-@pytest.fixture
-def cloud() -> FakeCloud:
-    return FakeCloud()
+@pytest.fixture(params=[True, False], ids=["files-api", "exec-files"])
+def cloud(request: pytest.FixtureRequest, tmp_path: Path) -> FakeCloud:
+    """The fake API, with the files API reaching the test workspace (``files-api``)
+    or with no files API, so that files go through exec (``exec-files``)."""
+    return FakeCloud(files_api=request.param, files_root=str(tmp_path))
 
 
 @pytest.fixture
 def backend(cloud: FakeCloud, tmp_path: Path) -> Kosa8Sandbox:
-    client = Kosa8Client(api_key=cloud.api_key, http_client=cloud.client())
-    aclient = AsyncKosa8Client(api_key=cloud.api_key, http_client=cloud.async_client())
+    client = Kosa8Client(api_key=cloud.api_key, http_client=cloud.client(), files_root=str(tmp_path))
+    aclient = AsyncKosa8Client(api_key=cloud.api_key, http_client=cloud.async_client(), files_root=str(tmp_path))
     sb = Kosa8Sandbox.create(client=client, workspace=str(tmp_path), persist_dirs=())
-    sb._async_client = aclient  # noqa: SLF001
+    sb._async_client = aclient
     return sb
 
 
@@ -83,7 +85,7 @@ def test_host_request_limit_returns_124(cloud: FakeCloud, backend: Kosa8Sandbox)
     cloud.fail_exec_with = (502, {"error": "host_failed", "message": "exec failed on the host: The operation was aborted due to timeout"})
     r = backend.execute("sleep 100")
     assert r.exit_code == 124
-    assert "30 s" in r.output
+    assert r.output.startswith("Command timed out (") and "90 s" in r.output
 
 
 def test_upload_download_and_errors(backend: Kosa8Sandbox, tmp_path: Path) -> None:
@@ -122,6 +124,7 @@ def test_async_variants(backend: Kosa8Sandbox, tmp_path: Path) -> None:
 
 def test_api_errors_are_reported_per_file(cloud: FakeCloud, backend: Kosa8Sandbox, tmp_path: Path) -> None:
     cloud.fail_exec_with = (409, {"error": "not_running", "message": "the sandbox is stopped, not running"})
+    cloud.files_api = False  # so that files go through exec
     p = str(tmp_path / "x")
     [up] = backend.upload_files([(p, b"x")])
     assert up.error and "not running" in up.error
@@ -137,5 +140,84 @@ def test_sleep_wake_delete(cloud: FakeCloud, backend: Kosa8Sandbox) -> None:
     backend.sleep()
     backend.wake()
     assert cloud.sandboxes[backend.id]["state"] == "running"
-    backend.delete()
+    backend.delete_sandbox()
     assert cloud.sandboxes[backend.id]["state"] == "deleted"
+
+
+def _files_calls(cloud: FakeCloud) -> int:
+    return sum(1 for _, p, _ in cloud.requests if "/files" in p)
+
+
+def test_files_api_carries_workspace_files(cloud: FakeCloud, backend: Kosa8Sandbox, tmp_path: Path) -> None:
+    execs = cloud.exec_count
+    path = str(tmp_path / "a" / "b.txt")
+    assert backend.upload_files([(path, b"hi")])[0].error is None
+    assert backend.download_files([path])[0].content == b"hi"
+    if cloud.files_api:
+        # mkdir + PUT + GET, with one exec to install the write and one to check the read, as the sandbox user.
+        assert cloud.exec_count == execs + 2 and _files_calls(cloud) == 3
+    else:
+        assert _files_calls(cloud) == 1  # one 501, then exec only
+    # Errors are reported as Deep Agents' codes.
+    assert backend.download_files([str(tmp_path / "missing")])[0].error == "file_not_found"
+    assert backend.upload_files([(str(tmp_path / "a"), b"x")])[0].error == "is_directory"
+
+
+async def test_async_files_api(cloud: FakeCloud, backend: Kosa8Sandbox, tmp_path: Path) -> None:
+    path = str(tmp_path / "c.bin")
+    data = os.urandom(70_000)
+    assert (await backend.aupload_files([(path, data)]))[0].error is None
+    assert (await backend.adownload_files([path]))[0].content == data
+
+
+def test_execute_timeout_sends_timeout_s(cloud: FakeCloud, backend: Kosa8Sandbox) -> None:
+    backend.execute("true", timeout=20)
+    body = [b for _, p, b in cloud.requests if p.endswith("/exec")][-1]
+    assert body["timeout_s"] == 21
+
+
+def test_api_exec_timeout_is_exit_124(cloud: FakeCloud, backend: Kosa8Sandbox) -> None:
+    cloud.fail_exec_with = (504, {"error": "exec_timeout", "message": "the command ran longer than its timeout_s", "stdout": "partial"})
+    r = backend.execute("sleep 100", timeout=5)
+    assert r.exit_code == 124 and "timed out after 5 seconds" in r.output and "partial" in r.output
+
+
+def test_files_api_off(tmp_path: Path) -> None:
+    cloud = FakeCloud(files_root=str(tmp_path))
+    client = Kosa8Client(api_key=cloud.api_key, http_client=cloud.client(), files_root=str(tmp_path))
+    sb = Kosa8Sandbox.create(client=client, workspace=str(tmp_path), persist_dirs=(), files_api=False)
+    assert sb.upload_files([(str(tmp_path / "x"), b"1")])[0].error is None
+    assert _files_calls(cloud) == 0
+
+
+def test_delete_is_the_file_delete(cloud: FakeCloud, backend: Kosa8Sandbox, tmp_path: Path) -> None:
+    f = tmp_path / "gone.txt"
+    f.write_text("x")
+    assert backend.delete(str(f)).error is None
+    assert not f.exists()
+    assert cloud.sandboxes[backend.id]["state"] == "running"
+
+
+def test_async_client_is_remade_on_a_new_event_loop() -> None:
+    """Pooled connections die with their loop: a second asyncio.run must not reuse them."""
+    import asyncio
+
+    from langchain_kosa8._kosa8 import AsyncKosa8Client
+
+    sandbox = Kosa8Sandbox(sandbox_id="sbx_loop", api_key="k8c_test")
+
+    async def current() -> AsyncKosa8Client:
+        first = sandbox.async_client
+        assert sandbox.async_client is first  # stable within one loop
+        return first
+
+    assert asyncio.run(current()) is not asyncio.run(current())
+
+    given = AsyncKosa8Client("k8c_test")
+    mine = Kosa8Sandbox(sandbox_id="sbx_loop", api_key="k8c_test", async_client=given)
+
+    async def theirs() -> AsyncKosa8Client:
+        return mine.async_client
+
+    assert asyncio.run(theirs()) is given
+    assert asyncio.run(theirs()) is given

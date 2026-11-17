@@ -30,7 +30,7 @@ try:
     result = backend.execute("python3 -c 'print(6 * 7)'")
     print(result.output, result.exit_code)
 finally:
-    backend.delete()
+    backend.delete_sandbox()
 ```
 
 To wrap a sandbox you already started (for example with the [kosa8 Python SDK](https://github.com/kosa8ai/kosa8-py) or the dashboard):
@@ -55,14 +55,12 @@ agent = create_deep_agent(
     backend=backend,
 )
 
-result = agent.invoke(
-    {"messages": [{"role": "user", "content": "Write a hello world Python script and run it"}]}
-)
+result = agent.invoke({"messages": [{"role": "user", "content": "Write a hello world Python script and run it"}]})
 
-backend.delete()
+backend.delete_sandbox()
 ```
 
-Async code can use `await Kosa8Sandbox.acreate(...)`, `aexecute()`, `aupload_files()`, `adownload_files()` and `adelete()`.
+Async code can use `await Kosa8Sandbox.acreate(...)`, `aexecute()`, `aupload_files()`, `adownload_files()` and `adelete_sandbox()`.
 
 ## Options
 
@@ -81,36 +79,37 @@ and passes the rest to the constructor:
 
 | Argument | Default | Meaning |
 |---|---|---|
-| `timeout` | `1800` | Default command timeout in seconds; `0` means none. Enforced inside the sandbox with `timeout -s KILL`. A timeout answers exit code `124`. |
+| `timeout` | `1800` | Default command timeout in seconds; `0` means none. Enforced inside the sandbox with `timeout -s KILL` and by the API's own `timeout_s`. A timeout answers exit code `124`. |
 | `workspace` | `/workspace` | Directory commands start in. |
-| `persist_dirs` | `("/tmp",)` | Directories outside the workspace kept on the workspace disk between commands (see below). |
+| `persist_dirs` | `("/tmp",)` | Directories outside the workspace kept on the workspace disk, for hosts that start each command in a fresh container (see below). |
 | `shell` | `"auto"` | Shell for each command: bash when the image has it, else `/bin/sh`. |
 | `stream` | `None` | `None`: use streamed exec when the host offers it, else buffered. `False`: buffered only. `True`: require streamed exec. |
+| `files_api` | `True` | Move files under `/workspace` through the kosa8 files API; `False` sends every file through exec. |
 
-Lifecycle helpers: `sleep()`, `wake()`, `delete()`, `close()` (and `asleep()`, `awake()`, `adelete()`, `aclose()`).
+Lifecycle helpers: `sleep()`, `wake()`, `delete_sandbox()`, `close()` (and `asleep()`, `awake()`, `adelete_sandbox()`, `aclose()`). `delete()` and `adelete()` are Deep Agents' file deletes (`BaseSandbox` runs `rm -rf` in the sandbox), not the sandbox's.
 
 ## How it works, and the limits that follow
 
-kosa8 Cloud's public API today offers create, exec, sleep, wake and delete on every host. This package uses only those calls, so it works on any kosa8 Cloud host. That shapes the behaviour:
+The package talks to the kosa8 Cloud REST API with `httpx`: create, exec (buffered and streamed), the files API, sleep, wake and delete.
 
-- **Each command runs in a fresh container** from the template image, over the sandbox's persistent `/workspace` disk. Files under `/workspace` carry from one command to the next and through sleep; files written elsewhere do not. Commands start in `/workspace`, so relative paths land there. Shell state (`cd`, exported variables) does not carry between commands, as with other `BaseSandbox` backends.
-- **`/tmp` is kept too.** Deep Agents writes temporary files to `/tmp` in one call and reads them in the next, so before each command the package bind-mounts or links `/tmp` onto `/workspace/.kosa8-persist/tmp`. Add other directories with `persist_dirs`. Packages installed into system directories (for example with `apk add` or `pip install` into site-packages) do not persist; install into `/workspace` (for example a virtualenv there) or use a template that already has them.
-- **Files travel through exec.** The production API has no file endpoints yet, so `upload_files()` and `download_files()` move bytes as base64 in chunks: about 36 KB per upload request (the API accepts 64 KiB of JSON per request) and 512 KiB per download request. A 10 MiB file takes about 290 requests to upload and 20 to download. The image needs `sh`, `base64` and `dd`, which the kosa8 templates have.
-- **Long commands.** A buffered exec has to finish within the host's request time, about 30 seconds. When a host offers streamed exec the package uses it and long commands run to their `timeout`; otherwise a command that runs past the host's limit returns exit code `124` with an explanation. Start long jobs so they finish in time, or split them up.
-- **Output.** A buffered exec keeps the first and last 1 MiB of each stream; when output is cut, `truncated` is `True`.
-- **No stdin, user or port APIs.** Commands run as the image's default user.
-- **grep on Alpine images.** The `python` template is Alpine-based, and busybox `grep` lacks the `-Z` flag that `BaseSandbox.grep()` uses. The package detects this once per sandbox and searches with a Python 3 script that returns the same results. With GNU grep or ripgrep in the image, `BaseSandbox.grep()` is used unchanged.
+- **State between commands.** Commands run in the sandbox's own container, so files written anywhere carry from one command to the next and through sleep and wake. Commands start in `/workspace`, so relative paths land there. Shell state (`cd`, exported variables) does not carry between commands, as with other `BaseSandbox` backends. For hosts that start each command in a fresh container, `/tmp` is also bind-mounted or linked onto `/workspace/.kosa8-persist/tmp` (`persist_dirs`); on a long-lived container this is a no-op after the first command.
+- **Files.** `upload_files()` and `download_files()` use the kosa8 files API for files under `/workspace` of up to 8 MiB. Larger files, files elsewhere, hosts without the files API, and every error (so that Deep Agents' `file_not_found`, `is_directory`, `permission_denied` and `invalid_path` codes are exact) go through exec as base64 in chunks: about 36 KB per upload request (the API accepts 64 KiB of JSON per request) and 512 KiB per download request. The image needs `sh`, `base64` and `dd`, which the kosa8 templates have.
+- **Long commands.** A buffered exec is held to 90 seconds. When the host offers streamed exec (kosa8 Cloud does), every command is streamed and runs to its `timeout`. On a host that only buffers, a command past 90 seconds returns exit code `124` with an explanation.
+- **Output.** A buffered exec keeps the first and last 1 MiB of each stream; when output is cut, `truncated` is `True`. A streamed exec keeps all of it.
+- **No stdin, user or port APIs.** Commands run as the image's default user. Each exec argument is at most 8 KiB, so commands travel in environment variables, and a command over the 64 KiB request is written to `/workspace/.kosa8-run/` and run from there.
+- **grep on Alpine images.** busybox `grep` lacks the `-Z` flag that `BaseSandbox.grep()` uses. The package detects this once per sandbox and searches with a Python 3 script that returns the same results. With GNU grep or ripgrep in the image, `BaseSandbox.grep()` is used unchanged.
 
-Not covered by this package: kosa8's checkpoint, rewind, fork and native file endpoints. They need a host with the kosa8 data plane, which production hosts do not offer yet, so this package does not call them.
+Not covered by this package: kosa8's snapshot, checkpoint, rewind and fork endpoints.
 
 ## Tests
 
 ```bash
-uv sync --group test
+uv sync --group dev
 uv run pytest tests/unit_tests
+uv run ruff check . && uv run ruff format --check . && uv run mypy
 ```
 
-The unit tests run against an in-process fake of the kosa8 Cloud API (`tests/fake_cloud.py`) that executes each command for real, so they need no network or key.
+The unit tests run against an in-process fake of the kosa8 Cloud API (`tests/fake_cloud.py`) that executes each command for real, with the files API on and off, so they need no network or key.
 
 LangChain's standard `SandboxIntegrationTests` run two ways:
 
@@ -128,7 +127,7 @@ LangChain's standard `SandboxIntegrationTests` run two ways:
   KOSA8_API_KEY=k8c_live_... uv run pytest tests/integration_tests
   ```
 
-Both runs mark a few standard tests as expected failures, with reasons in `tests/standard_overrides.py`: the newest `langchain-tests` (1.1.9) and `deepagents` (0.7.35) releases disagree on `glob()` paths and on `write()` to an existing file, which affects every `BaseSandbox` backend.
+Both runs mark a few standard tests as expected failures, with reasons in `tests/standard_overrides.py`: `langchain-tests` 1.1.9 and `deepagents` 0.7 disagree on `glob()` paths and on `write()` to an existing file, which affects every `BaseSandbox` backend.
 
 ## License
 

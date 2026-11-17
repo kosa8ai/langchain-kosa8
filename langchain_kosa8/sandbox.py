@@ -15,7 +15,6 @@ from deepagents.backends.protocol import (
 from deepagents.backends.sandbox import BaseSandbox
 
 from langchain_kosa8._grep import PROBE_CMD, build_portable_grep_cmd, parse_grep_output
-
 from langchain_kosa8._kosa8 import (
     DEFAULT_PERSIST_DIRS,
     DEFAULT_WORKSPACE,
@@ -25,8 +24,14 @@ from langchain_kosa8._kosa8 import (
     Kosa8Error,
     Kosa8TimeoutError,
     SandboxSession,
+    adownload,
     adrive,
+    afiles_put,
+    aupload,
+    download,
     drive,
+    files_put,
+    upload,
 )
 
 DEFAULT_TEMPLATE = "python"
@@ -54,10 +59,7 @@ def _timeout_response(timeout: int | None, partial: ExecOutput | None = None, re
     return ExecuteResponse(output=output, exit_code=TIMEOUT_EXIT_CODE, truncated=False)
 
 
-_HOST_LIMIT_REASON = (
-    "kosa8 Cloud ended the request; a buffered exec must finish within about "
-    "30 s on hosts without streamed exec"
-)
+_HOST_LIMIT_REASON = "kosa8 Cloud ended the request; a buffered exec is held to 90 s on hosts without streamed exec"
 
 
 class Kosa8Sandbox(BaseSandbox):
@@ -67,11 +69,13 @@ class Kosa8Sandbox(BaseSandbox):
     their async variants; `BaseSandbox` builds `ls`, `read`, `write`, `edit`,
     `glob` and `grep` on top of them.
 
-    Each command runs in a fresh container over the sandbox's persistent
-    `/workspace` disk. Commands start in `/workspace`, and `/tmp` is kept on
-    that disk too (see `persist_dirs`). File transfer goes through exec, in
-    base64 chunks, because the kosa8 Cloud API has no file endpoints on
-    production hosts yet.
+    Commands run in the sandbox's own microVM container, whose filesystem
+    lasts from one command to the next and through sleep and wake. They
+    start in `/workspace`. Commands are streamed when the host offers it, so
+    they are not held to the 90 s of a buffered exec, and `timeout` is
+    enforced both inside the sandbox and by the API's `timeout_s`. Files
+    under `/workspace` (up to 8 MiB) go through the kosa8 files API; other
+    files go through exec in base64 chunks.
 
     Example:
         ```python
@@ -81,7 +85,7 @@ class Kosa8Sandbox(BaseSandbox):
         try:
             print(backend.execute("python3 --version").output)
         finally:
-            backend.delete()
+            backend.delete_sandbox()
         ```
     """
 
@@ -98,6 +102,7 @@ class Kosa8Sandbox(BaseSandbox):
         persist_dirs: Sequence[str] = DEFAULT_PERSIST_DIRS,
         shell: str = "auto",
         stream: bool | None = None,
+        files_api: bool = True,
     ) -> None:
         """Wrap an existing kosa8 Cloud sandbox.
 
@@ -110,21 +115,33 @@ class Kosa8Sandbox(BaseSandbox):
             async_client: An `AsyncKosa8Client` to use for async calls.
             timeout: Default command timeout in seconds when `execute()` is
                 called without one. `0` means no timeout.
-            workspace: Directory commands start in. On kosa8 Cloud only this
-                disk persists between commands.
+            workspace: Directory commands start in.
             persist_dirs: Directories outside the workspace to keep on the
-                workspace disk between commands. Defaults to `("/tmp",)`.
+                workspace disk, for hosts that start each command in a fresh
+                container. Defaults to `("/tmp",)`.
             shell: Shell that runs each command: `"auto"` (bash if the image
                 has it, else sh) or an absolute path.
             stream: `None` to use streamed exec when the host offers it,
                 `False` for buffered exec only, `True` to require streaming.
+            files_api: Move files under `/workspace` through the kosa8 files
+                API; `False` sends every file through exec.
         """
         self._sandbox_id = sandbox_id
         self._api_key = api_key
         self._base_url = base_url
         self._stream = stream
+        self._files_api = None if files_api else False
         self._client = client
         self._async_client = async_client
+        # An httpx.AsyncClient's pooled connections belong to the event loop
+        # that opened them, so a client this backend made is remade on a new
+        # loop (each asyncio.run, or each async test). A caller's own client
+        # is used as given.
+        self._owns_async_client = async_client is None
+        self._async_loop: asyncio.AbstractEventLoop | None = None
+        for c in (client, async_client):
+            if c is not None and not files_api:
+                c.files_api = False
         self._default_timeout = timeout
         self._session = SandboxSession(workspace=workspace, persist_dirs=tuple(persist_dirs), shell=shell)
         self._native_grep: bool | None = None
@@ -158,7 +175,8 @@ class Kosa8Sandbox(BaseSandbox):
             **kwargs: Passed to the constructor.
         """
         stream = kwargs.get("stream")
-        client = client or Kosa8Client(api_key, base_url=base_url, stream=stream)
+        files_api = None if kwargs.get("files_api", True) else False
+        client = client or Kosa8Client(api_key, base_url=base_url, stream=stream, files_api=files_api)
         box = client.create_sandbox(template=template, region=region, sleep_after_s=sleep_after_s, ttl_s=ttl_s)
         return cls(sandbox_id=box["id"], api_key=api_key, base_url=base_url, client=client, **kwargs)
 
@@ -177,20 +195,34 @@ class Kosa8Sandbox(BaseSandbox):
     ) -> Kosa8Sandbox:
         """Async version of `create()`."""
         stream = kwargs.get("stream")
-        async_client = async_client or AsyncKosa8Client(api_key, base_url=base_url, stream=stream)
+        files_api = None if kwargs.get("files_api", True) else False
+        owned = async_client is None
+        async_client = async_client or AsyncKosa8Client(api_key, base_url=base_url, stream=stream, files_api=files_api)
         box = await async_client.create_sandbox(template=template, region=region, sleep_after_s=sleep_after_s, ttl_s=ttl_s)
-        return cls(sandbox_id=box["id"], api_key=api_key, base_url=base_url, async_client=async_client, **kwargs)
+        sandbox = cls(sandbox_id=box["id"], api_key=api_key, base_url=base_url, async_client=async_client, **kwargs)
+        if owned:
+            sandbox._owns_async_client = True
+            sandbox._async_loop = asyncio.get_running_loop()
+        return sandbox
 
     @property
     def client(self) -> Kosa8Client:
         if self._client is None:
-            self._client = Kosa8Client(self._api_key, base_url=self._base_url, stream=self._stream)
+            self._client = Kosa8Client(self._api_key, base_url=self._base_url, stream=self._stream, files_api=self._files_api)
         return self._client
 
     @property
     def async_client(self) -> AsyncKosa8Client:
-        if self._async_client is None:
-            self._async_client = AsyncKosa8Client(self._api_key, base_url=self._base_url, stream=self._stream)
+        try:
+            loop: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        stale = self._owns_async_client and loop is not None and self._async_loop not in (None, loop)
+        if self._async_client is None or stale:
+            # The old client's connections died with its loop; drop it unclosed.
+            self._async_client = AsyncKosa8Client(self._api_key, base_url=self._base_url, stream=self._stream, files_api=self._files_api)
+        if self._owns_async_client and loop is not None:
+            self._async_loop = loop
         return self._async_client
 
     @property
@@ -215,7 +247,8 @@ class Kosa8Sandbox(BaseSandbox):
         Args:
             command: Shell command string.
             timeout: Seconds to wait. `None` uses the backend default; `0`
-                means no timeout. Enforced in the sandbox with `timeout`.
+                means no timeout. Enforced in the sandbox with `timeout` and
+                by the API's `timeout_s`.
 
         Returns:
             `ExecuteResponse` with stdout, then stderr in `<stderr>` tags, and
@@ -224,19 +257,23 @@ class Kosa8Sandbox(BaseSandbox):
         t = self._effective_timeout(timeout)
         op = self._session.command_op(command, timeout=t)
         try:
-            out = drive(op, lambda req: self.client.exec(self._sandbox_id, req))
+            out = drive(op, lambda req: self.client.exec(self._sandbox_id, req), files_put(self.client, self._session, self._sandbox_id))
         except Kosa8TimeoutError:
-            return _timeout_response(t, reason=_HOST_LIMIT_REASON)
+            return _timeout_response(None, reason=_HOST_LIMIT_REASON)
         return self._response(out, t)
 
-    async def aexecute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:  # noqa: ASYNC109
+    async def aexecute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
         """Async version of `execute()`."""
         t = self._effective_timeout(timeout)
         op = self._session.command_op(command, timeout=t)
         try:
-            out = await adrive(op, lambda req: self.async_client.exec(self._sandbox_id, req))
+            out = await adrive(
+                op,
+                lambda req: self.async_client.exec(self._sandbox_id, req),
+                afiles_put(self.async_client, self._session, self._sandbox_id),
+            )
         except Kosa8TimeoutError:
-            return _timeout_response(t, reason=_HOST_LIMIT_REASON)
+            return _timeout_response(None, reason=_HOST_LIMIT_REASON)
         return self._response(out, t)
 
     # Files -----------------------------------------------------------------
@@ -249,7 +286,7 @@ class Kosa8Sandbox(BaseSandbox):
         responses: list[FileUploadResponse] = []
         for path, content in files:
             try:
-                err = drive(self._session.upload_op(path, content), lambda req: self.client.exec(self._sandbox_id, req))
+                err = upload(self.client, self._session, self._sandbox_id, path, content)
             except Kosa8Error as e:
                 err = f"upload failed: {e}"
             responses.append(FileUploadResponse(path=path, error=err))
@@ -260,7 +297,7 @@ class Kosa8Sandbox(BaseSandbox):
         responses: list[FileUploadResponse] = []
         for path, content in files:
             try:
-                err = await adrive(self._session.upload_op(path, content), lambda req: self.async_client.exec(self._sandbox_id, req))
+                err = await aupload(self.async_client, self._session, self._sandbox_id, path, content)
             except Kosa8Error as e:
                 err = f"upload failed: {e}"
             responses.append(FileUploadResponse(path=path, error=err))
@@ -271,7 +308,7 @@ class Kosa8Sandbox(BaseSandbox):
         responses: list[FileDownloadResponse] = []
         for path in paths:
             try:
-                got = drive(self._session.download_op(path), lambda req: self.client.exec(self._sandbox_id, req))
+                got = download(self.client, self._session, self._sandbox_id, path)
                 responses.append(FileDownloadResponse(path=path, content=got.content, error=got.error))
             except Kosa8Error as e:
                 responses.append(FileDownloadResponse(path=path, content=None, error=f"download failed: {e}"))
@@ -282,7 +319,7 @@ class Kosa8Sandbox(BaseSandbox):
         responses: list[FileDownloadResponse] = []
         for path in paths:
             try:
-                got = await adrive(self._session.download_op(path), lambda req: self.async_client.exec(self._sandbox_id, req))
+                got = await adownload(self.async_client, self._session, self._sandbox_id, path)
                 responses.append(FileDownloadResponse(path=path, content=got.content, error=got.error))
             except Kosa8Error as e:
                 responses.append(FileDownloadResponse(path=path, content=None, error=f"download failed: {e}"))
@@ -348,8 +385,11 @@ class Kosa8Sandbox(BaseSandbox):
         """Restore a sleeping sandbox now rather than on the next command."""
         self.client.wake_sandbox(self._sandbox_id)
 
-    def delete(self) -> None:
-        """Delete the sandbox. A sandbox that is already gone is not an error."""
+    def delete_sandbox(self) -> None:
+        """Delete the sandbox. A sandbox that is already gone is not an error.
+
+        (``delete(path)`` is Deep Agents' file delete, inherited from ``BaseSandbox``.)
+        """
         self.client.delete_sandbox(self._sandbox_id)
 
     async def asleep(self) -> None:
@@ -358,7 +398,7 @@ class Kosa8Sandbox(BaseSandbox):
     async def awake(self) -> None:
         await self.async_client.wake_sandbox(self._sandbox_id)
 
-    async def adelete(self) -> None:
+    async def adelete_sandbox(self) -> None:
         await self.async_client.delete_sandbox(self._sandbox_id)
 
     def close(self) -> None:

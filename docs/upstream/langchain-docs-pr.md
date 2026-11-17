@@ -1,40 +1,14 @@
 # Fallback: PR to langchain-ai/docs
 
-Use only if a maintainer asks for a PR rather than the listing issue.
+Use only if a maintainer asks for a PR rather than the listing issue; the docs
+automation closes hand-written listing PRs from outside the org.
 
-## Change
+The branch `drvt69talati/docs-1:docs/kosa8-sandbox` makes the same four-file
+change the listing automation made for BoxdSandbox (PR #7622):
 
-In `scripts/data/integration_external_docs.yaml`, under `python:` → `sandboxes:`,
-append:
+- `packages.yml`: a `langchain-kosa8` entry (`name_title: Kosa8Sandbox`).
+- `scripts/data/integration_external_docs.yaml`: a `Kosa8Sandbox` row under `python.sandboxes`.
+- `src/oss/python/integrations/providers/all_providers.mdx`: a `Kosa8Sandbox` card, in alphabetical order.
+- `src/snippets/oss/python-sandboxes-downloads.mdx`: the `Kosa8Sandbox` row (N/A until PyPI counts downloads).
 
-```yaml
-  - name: Kosa8Sandbox
-    pypi: langchain-kosa8
-    docs_url: https://github.com/kosa8ai/langchain-kosa8#readme
-```
-
-Then run `scripts/refresh_integration_downloads.py` (it regenerates
-`src/snippets/oss/python-sandboxes-downloads.mdx`) and commit both files.
-
-## PR title
-
-`docs: list kosa8 sandbox integration (langchain-kosa8)`
-
-## PR description
-
-```markdown
-## Summary
-
-Adds `Kosa8Sandbox` (PyPI: `langchain-kosa8`) to the external sandbox
-integrations table.
-
-`langchain-kosa8` subclasses `BaseSandbox` and implements `execute`,
-`upload_files`, `download_files`, `id` and their async variants against the
-kosa8 Cloud API. Source and docs: https://github.com/kosa8ai/langchain-kosa8
-
-## Test plan
-
-- [ ] `SandboxIntegrationTests` run against kosa8 Cloud: <paste result>
-- [ ] Downloads table regenerated with `scripts/refresh_integration_downloads.py`
-- [ ] Docs URL resolves
-```
+The PR title and description are in the coordinator's scratchpad (`langchain-docs-pr-body.md`).
