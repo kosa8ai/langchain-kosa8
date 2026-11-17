@@ -922,7 +922,7 @@ Op = Generator["ExecRequest | UploadRequest", Any, T]
 # target as the sandbox user and remove them. With no parts the target is
 # made empty. Errors go to stderr as K8ERR:<code>.
 _INSTALL_SCRIPT = (
-    't=$1; shift; '
+    "t=$1; shift; "
     '[ -d "$t" ] && { rm -f "$@"; echo K8ERR:is_directory >&2; exit 21; }; '
     'dir=${t%/*}; [ -z "$dir" ] && dir=/; '
     'if [ ! -d "$dir" ]; then mkdir -p "$dir" 2>/dev/null || { rm -f "$@"; '
@@ -938,7 +938,7 @@ _INSTALL_SCRIPT = (
 # "K8:<status> <size> <parts>"; a file over $2 bytes (or any, with $5) is
 # split into $3.0, $3.1, ... for the files API to read.
 _READ_SCRIPT = (
-    'p=$1; b=$2; o=$3; mx=$4; '
+    "p=$1; b=$2; o=$3; mx=$4; "
     'if [ -d "$p" ]; then echo K8:is_directory; exit 0; fi; '
     'if [ ! -e "$p" ]; then echo K8:file_not_found; exit 0; fi; '
     'if [ ! -r "$p" ]; then echo K8:permission_denied; exit 0; fi; '
@@ -1107,9 +1107,7 @@ def upload(client: Kosa8Client, session: SandboxSession, sandbox_id: str, path: 
 
 async def aupload(client: AsyncKosa8Client, session: SandboxSession, sandbox_id: str, path: str, data: bytes) -> str | None:
     """The asynchronous twin of :func:`upload`."""
-    return await adrive(
-        session.upload_op(path, data), lambda req: client.exec(sandbox_id, req), afiles_put(client, session, sandbox_id)
-    )
+    return await adrive(session.upload_op(path, data), lambda req: client.exec(sandbox_id, req), afiles_put(client, session, sandbox_id))
 
 
 def _read_request(

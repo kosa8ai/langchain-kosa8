@@ -133,6 +133,12 @@ class Kosa8Sandbox(BaseSandbox):
         self._files_api = None if files_api else False
         self._client = client
         self._async_client = async_client
+        # An httpx.AsyncClient's pooled connections belong to the event loop
+        # that opened them, so a client this backend made is remade on a new
+        # loop (each asyncio.run, or each async test). A caller's own client
+        # is used as given.
+        self._owns_async_client = async_client is None
+        self._async_loop: asyncio.AbstractEventLoop | None = None
         for c in (client, async_client):
             if c is not None and not files_api:
                 c.files_api = False
@@ -190,9 +196,14 @@ class Kosa8Sandbox(BaseSandbox):
         """Async version of `create()`."""
         stream = kwargs.get("stream")
         files_api = None if kwargs.get("files_api", True) else False
+        owned = async_client is None
         async_client = async_client or AsyncKosa8Client(api_key, base_url=base_url, stream=stream, files_api=files_api)
         box = await async_client.create_sandbox(template=template, region=region, sleep_after_s=sleep_after_s, ttl_s=ttl_s)
-        return cls(sandbox_id=box["id"], api_key=api_key, base_url=base_url, async_client=async_client, **kwargs)
+        sandbox = cls(sandbox_id=box["id"], api_key=api_key, base_url=base_url, async_client=async_client, **kwargs)
+        if owned:
+            sandbox._owns_async_client = True
+            sandbox._async_loop = asyncio.get_running_loop()
+        return sandbox
 
     @property
     def client(self) -> Kosa8Client:
@@ -202,8 +213,16 @@ class Kosa8Sandbox(BaseSandbox):
 
     @property
     def async_client(self) -> AsyncKosa8Client:
-        if self._async_client is None:
+        try:
+            loop: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        stale = self._owns_async_client and loop is not None and self._async_loop not in (None, loop)
+        if self._async_client is None or stale:
+            # The old client's connections died with its loop; drop it unclosed.
             self._async_client = AsyncKosa8Client(self._api_key, base_url=self._base_url, stream=self._stream, files_api=self._files_api)
+        if self._owns_async_client and loop is not None:
+            self._async_loop = loop
         return self._async_client
 
     @property

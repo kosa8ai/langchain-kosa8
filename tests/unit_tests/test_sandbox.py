@@ -196,3 +196,28 @@ def test_delete_is_the_file_delete(cloud: FakeCloud, backend: Kosa8Sandbox, tmp_
     assert backend.delete(str(f)).error is None
     assert not f.exists()
     assert cloud.sandboxes[backend.id]["state"] == "running"
+
+
+def test_async_client_is_remade_on_a_new_event_loop() -> None:
+    """Pooled connections die with their loop: a second asyncio.run must not reuse them."""
+    import asyncio
+
+    from langchain_kosa8._kosa8 import AsyncKosa8Client
+
+    sandbox = Kosa8Sandbox(sandbox_id="sbx_loop", api_key="k8c_test")
+
+    async def current() -> AsyncKosa8Client:
+        first = sandbox.async_client
+        assert sandbox.async_client is first  # stable within one loop
+        return first
+
+    assert asyncio.run(current()) is not asyncio.run(current())
+
+    given = AsyncKosa8Client("k8c_test")
+    mine = Kosa8Sandbox(sandbox_id="sbx_loop", api_key="k8c_test", async_client=given)
+
+    async def theirs() -> AsyncKosa8Client:
+        return mine.async_client
+
+    assert asyncio.run(theirs()) is given
+    assert asyncio.run(theirs()) is given
