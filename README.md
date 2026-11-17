@@ -99,7 +99,21 @@ The package talks to the kosa8 Cloud REST API with `httpx`: create, exec (buffer
 - **No stdin, user or port APIs.** Commands run as the image's default user. Each exec argument is at most 8 KiB, so commands travel in environment variables, and a command over the 64 KiB request is written to `/workspace/.kosa8-run/` and run from there.
 - **grep on Alpine images.** busybox `grep` lacks the `-Z` flag that `BaseSandbox.grep()` uses. The package detects this once per sandbox and searches with a Python 3 script that returns the same results. With GNU grep or ripgrep in the image, `BaseSandbox.grep()` is used unchanged.
 
-Not covered by this package: kosa8's snapshot, checkpoint, rewind and fork endpoints.
+The `Kosa8Sandbox` backend does not use kosa8's snapshot, checkpoint, rewind or fork endpoints. The bundled client has methods for most of them if you want to call them yourself (see below).
+
+## The bundled client and its errors
+
+`langchain_kosa8.Kosa8Client` and `AsyncKosa8Client` cover more of the sandbox API than the backend needs: `update_sandbox` (PATCH lifetime and sleep timer, or `clear_lifetime=True`), `list_sandboxes` / `iter_sandboxes` (`limit` / `cursor` paging), `list_files`, `create_checkpoint`, `list_checkpoints`, `rewind_sandbox` and `fork_sandbox`. `create_sandbox` checks `ttl_s` (60 s to 90 days) before sending, and also takes `delete_after` (Unix ms or ISO 8601). Hosts without the data plane answer 501 to the checkpoint, rewind and fork calls.
+
+Errors are typed. All are `Kosa8Error`, with `status`, `code` and the decoded `body`:
+
+| Error | When |
+|---|---|
+| `Kosa8PaymentRequiredError` | 402: no payment method, or the spending cap is reached. Show `upgrade_url`; an agent should relay `agent_message` and stop. |
+| `Kosa8OrgFrozenError` | 423 `org_frozen`: an owner or admin must unfreeze the org. |
+| `Kosa8RateLimitError` | 429, including `quota_exceeded`; `retry_after` is in seconds. |
+| `Kosa8ExecTimeoutError` | An exec cut off by the API's time limit (also a `Kosa8TimeoutError`). |
+| `Kosa8NotSupportedError` | 501: the host cannot do this yet. |
 
 ## Tests
 

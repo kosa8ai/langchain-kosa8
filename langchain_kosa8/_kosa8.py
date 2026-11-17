@@ -14,6 +14,19 @@ and needs nothing but ``httpx``. What it relies on:
 * ``GET`` / ``PUT /v1/sandboxes/{id}/files?path=`` and ``POST .../files/mkdir``
   for files under ``/workspace`` (at most 8 MiB each).
 
+The clients also cover the rest of the sandbox API for callers who want it:
+``PATCH`` (lifetime and sleep timer), list with ``limit``/``cursor`` paging,
+``GET .../files/list``, checkpoints, rewind and fork. Hosts without the data
+plane answer 501 (:class:`Kosa8NotSupportedError`) to the last ones; the
+integrations themselves do not rely on them.
+
+Errors are typed: :class:`Kosa8PaymentRequiredError` (402, with
+``upgrade_url`` and ``agent_message``), :class:`Kosa8OrgFrozenError` (423),
+:class:`Kosa8RateLimitError` (429, with ``retry_after``),
+:class:`Kosa8ExecTimeoutError` (an exec cut off by the API's time limit; a
+:class:`Kosa8TimeoutError`) and :class:`Kosa8NotSupportedError` (501). All
+are :class:`Kosa8Error` with ``status``, ``code`` and the decoded ``body``.
+
 How commands run on kosa8 Cloud, and what this module does about it:
 
 * Commands run in the sandbox's own container, whose filesystem lasts from
@@ -56,10 +69,10 @@ import re
 import shlex
 import time
 import uuid
-from collections.abc import Callable, Generator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Generator, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, TypeVar
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 import httpx
 
@@ -72,7 +85,13 @@ __all__ = [
     "ExecRequest",
     "Kosa8Client",
     "Kosa8Error",
+    "Kosa8ExecTimeoutError",
+    "Kosa8NotSupportedError",
+    "Kosa8OrgFrozenError",
+    "Kosa8PaymentRequiredError",
+    "Kosa8RateLimitError",
     "Kosa8TimeoutError",
+    "SandboxPage",
     "SandboxSession",
     "UploadRequest",
     "adownload",
@@ -105,6 +124,10 @@ MAX_FILES_API_BYTES = 8 * 1024 * 1024
 # How long, and how often, a sandbox booting cold is polled until it runs.
 CREATE_WAIT_S = 300.0
 CREATE_POLL_S = 1.0
+# A lifetime is 60 s to 90 days; a fork makes 1 to 100 copies.
+MIN_TTL_S = 60
+MAX_TTL_S = 90 * 86400
+MAX_FORK = 100
 
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _DROPPED_RE = re.compile(r"\n\[k8agent: \d+ bytes of output dropped\]\n")
@@ -124,6 +147,61 @@ class Kosa8Error(Exception):
 
 class Kosa8TimeoutError(Kosa8Error, TimeoutError):
     """A command or request did not finish in time."""
+
+
+class Kosa8ExecTimeoutError(Kosa8TimeoutError):
+    """An exec was cut off by the API's time limit (504 ``exec_timeout``, or a
+    502/504 "timed out" from the host on an exec). A buffered exec is held to
+    about 90 s; streamed exec, used when the host offers it, is not."""
+
+
+class Kosa8PaymentRequiredError(Kosa8Error):
+    """402: new work is refused until a payment method is on file
+    (``payment_required``), or the spending cap is reached
+    (``spending_cap_reached``).
+
+    ``upgrade_url`` is where the person fixes it; ``agent_message`` is a
+    sentence an agent should relay to its person word for word, then stop.
+    """
+
+    @property
+    def upgrade_url(self) -> str | None:
+        return _body_str(self.body, "upgrade_url")
+
+    @property
+    def agent_message(self) -> str | None:
+        return _body_str(self.body, "agent_message")
+
+
+class Kosa8OrgFrozenError(Kosa8Error):
+    """423 ``org_frozen``: the org is frozen in the Security Center; an owner or admin must unfreeze it."""
+
+
+class Kosa8RateLimitError(Kosa8Error):
+    """429: too many requests, or ``quota_exceeded`` (the org's active sandbox limit).
+
+    ``retry_after`` is the server's Retry-After in seconds, when it sent one.
+    """
+
+    retry_after: float | None = None
+
+
+class Kosa8NotSupportedError(Kosa8Error):
+    """501: the sandbox's host cannot do this yet (``not_available`` / ``not_supported``)."""
+
+
+def _body_str(body: Any, key: str) -> str | None:
+    if isinstance(body, dict) and isinstance(body.get(key), str) and body[key]:
+        return body[key]
+    return None
+
+
+@dataclass
+class SandboxPage:
+    """One page of sandboxes; ``next_cursor`` is ``None`` on the last page."""
+
+    sandboxes: list[dict[str, Any]]
+    next_cursor: str | None = None
 
 
 @dataclass
@@ -220,10 +298,32 @@ def _error_from_response(resp: httpx.Response) -> Kosa8Error:
             message = code
     elif resp.text:
         message = f"{message}: {resp.text[:300]}"
-    cls = Kosa8Error
-    if code == "exec_timeout" or (resp.status_code in (502, 504) and _HOST_TIMEOUT_RE.search(message)):
+    status = resp.status_code
+    try:
+        on_exec = resp.request.url.path.endswith("/exec")
+    except RuntimeError:  # a Response built without a request
+        on_exec = False
+    cls: type[Kosa8Error] = Kosa8Error
+    if code == "exec_timeout" or (on_exec and status in (502, 504) and _HOST_TIMEOUT_RE.search(message)):
+        cls = Kosa8ExecTimeoutError
+    elif status in (502, 504) and _HOST_TIMEOUT_RE.search(message):
         cls = Kosa8TimeoutError
-    return cls(message, status=resp.status_code, code=code, body=body)
+    elif status == 402:
+        cls = Kosa8PaymentRequiredError
+    elif status == 423:
+        cls = Kosa8OrgFrozenError
+    elif status == 429:
+        cls = Kosa8RateLimitError
+    elif status == 501:
+        cls = Kosa8NotSupportedError
+    err = cls(message, status=status, code=code, body=body)
+    if isinstance(err, Kosa8RateLimitError):
+        ra = resp.headers.get("retry-after")
+        try:
+            err.retry_after = float(ra) if ra is not None else None
+        except ValueError:
+            err.retry_after = None
+    return err
 
 
 def _exec_body(
@@ -356,12 +456,27 @@ def _sandbox_path(sandbox_id: str, suffix: str = "") -> str:
     return f"/v1/sandboxes/{quote(sandbox_id, safe='')}{suffix}"
 
 
+def _is_int(v: Any) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def _check_lifetime(ttl_s: int | None, delete_after: int | str | None) -> None:
+    if ttl_s is not None and delete_after is not None:
+        raise ValueError("give ttl_s or delete_after, not both")
+    if ttl_s is not None and (not _is_int(ttl_s) or not MIN_TTL_S <= ttl_s <= MAX_TTL_S):
+        raise ValueError(f"ttl_s must be a whole number of seconds from {MIN_TTL_S} to {MAX_TTL_S}")
+    if delete_after is not None and not (_is_int(delete_after) or (isinstance(delete_after, str) and delete_after)):
+        raise ValueError("delete_after must be a Unix time in milliseconds or an ISO 8601 time")
+
+
 def _create_body(
     template: str | None,
     region: str | None,
     sleep_after_s: int | None,
     ttl_s: int | None,
+    delete_after: int | str | None = None,
 ) -> dict[str, Any]:
+    _check_lifetime(ttl_s, delete_after)
     body: dict[str, Any] = {}
     if template is not None:
         body["template"] = template
@@ -371,7 +486,51 @@ def _create_body(
         body["sleep_after_s"] = sleep_after_s
     if ttl_s is not None:
         body["ttl_s"] = ttl_s
+    if delete_after is not None:
+        body["delete_after"] = delete_after
     return body
+
+
+def _update_body(ttl_s: int | None, delete_after: int | str | None, sleep_after_s: int | None, clear_lifetime: bool) -> dict[str, Any]:
+    if clear_lifetime and (ttl_s is not None or delete_after is not None):
+        raise ValueError("clear_lifetime cannot be combined with ttl_s or delete_after")
+    _check_lifetime(ttl_s, delete_after)
+    body: dict[str, Any] = {}
+    if clear_lifetime:
+        body["ttl_s"] = None
+    if ttl_s is not None:
+        body["ttl_s"] = ttl_s
+    if delete_after is not None:
+        body["delete_after"] = delete_after
+    if sleep_after_s is not None:
+        body["sleep_after_s"] = sleep_after_s
+    if not body:
+        raise ValueError("give ttl_s, delete_after, sleep_after_s or clear_lifetime")
+    return body
+
+
+def _list_path(all: bool, limit: int | None, cursor: str | None) -> str:
+    q: dict[str, str] = {}
+    if all:
+        q["all"] = "1"
+    if limit is not None:
+        if not _is_int(limit) or limit < 1:
+            raise ValueError("limit must be a positive whole number")
+        q["limit"] = str(limit)
+    if cursor:
+        q["cursor"] = cursor
+    return "/v1/sandboxes" + ("?" + urlencode(q) if q else "")
+
+
+def _page(r: Any) -> SandboxPage:
+    r = r or {}
+    nxt = r.get("next_cursor")
+    return SandboxPage(sandboxes=list(r.get("sandboxes", [])), next_cursor=nxt if isinstance(nxt, str) and nxt else None)
+
+
+def _check_fork(n: int) -> None:
+    if not _is_int(n) or not 1 <= n <= MAX_FORK:
+        raise ValueError(f"n must be a whole number from 1 to {MAX_FORK}")
 
 
 class Kosa8Client:
@@ -484,12 +643,16 @@ class Kosa8Client:
         region: str | None = None,
         sleep_after_s: int | None = None,
         ttl_s: int | None = None,
+        delete_after: int | str | None = None,
     ) -> dict[str, Any]:
         """Start a sandbox and return its record once it is running.
 
-        A create that boots cold answers ``creating``; it is polled until it
-        runs, and deleted if it does not."""
-        r = self._request("POST", "/v1/sandboxes", _create_body(template, region, sleep_after_s, ttl_s), timeout=max(self.timeout, 90.0))
+        ``ttl_s`` (60 s to 90 days) or ``delete_after`` (Unix ms or ISO 8601)
+        deletes it automatically. A create that boots cold answers
+        ``creating``; it is polled until it runs, and deleted if it does not."""
+        r = self._request(
+            "POST", "/v1/sandboxes", _create_body(template, region, sleep_after_s, ttl_s, delete_after), timeout=max(self.timeout, 90.0)
+        )
         box = r["sandbox"]
         deadline = time.monotonic() + CREATE_WAIT_S
         try:
@@ -526,6 +689,64 @@ class Kosa8Client:
 
     def list_templates(self) -> list[dict[str, Any]]:
         return (self._request("GET", "/v1/templates"))["templates"]
+
+    def list_sandboxes(self, *, all: bool = False, limit: int | None = None, cursor: str | None = None) -> SandboxPage:
+        """One page of the org's sandboxes, newest first."""
+        return _page(self._request("GET", _list_path(all, limit, cursor)))
+
+    def iter_sandboxes(self, *, all: bool = False, page_size: int | None = None) -> Iterator[dict[str, Any]]:
+        """Every sandbox, following ``next_cursor``."""
+        cursor: str | None = None
+        seen: set[str] = set()
+        while True:
+            page = self.list_sandboxes(all=all, limit=page_size, cursor=cursor)
+            yield from page.sandboxes
+            if not page.next_cursor or page.next_cursor in seen:
+                return
+            seen.add(page.next_cursor)
+            cursor = page.next_cursor
+
+    def update_sandbox(
+        self,
+        sandbox_id: str,
+        *,
+        ttl_s: int | None = None,
+        delete_after: int | str | None = None,
+        sleep_after_s: int | None = None,
+        clear_lifetime: bool = False,
+    ) -> dict[str, Any]:
+        """Change a sandbox's lifetime or sleep timer (PATCH)."""
+        body = _update_body(ttl_s, delete_after, sleep_after_s, clear_lifetime)
+        return self._request("PATCH", _sandbox_path(sandbox_id), body)["sandbox"]
+
+    # Data plane: may answer 501 (Kosa8NotSupportedError) on some hosts -------
+
+    def list_files(self, sandbox_id: str, path: str = FILES_API_ROOT) -> list[dict[str, Any]]:
+        """A folder's entries."""
+        resp = self._send("GET", _sandbox_path(sandbox_id, "/files/list"), params={"path": path})
+        return (resp.json() or {}).get("files", [])
+
+    def create_checkpoint(self, sandbox_id: str, label: str | None = None) -> dict[str, Any]:
+        """Save the sandbox's memory, processes and disk."""
+        body = {"label": label} if label is not None else {}
+        return self._request("POST", _sandbox_path(sandbox_id, "/checkpoints"), body, timeout=max(self.timeout, 120.0))["checkpoint"]
+
+    def list_checkpoints(self, sandbox_id: str) -> list[dict[str, Any]]:
+        """The sandbox's checkpoints, oldest first."""
+        return (self._request("GET", _sandbox_path(sandbox_id, "/checkpoints")) or {}).get("checkpoints", [])
+
+    def rewind_sandbox(self, sandbox_id: str, checkpoint_id: str) -> dict[str, Any]:
+        """Go back to a checkpoint; answers ``{sandbox, checkpoint, backup, ms}``."""
+        return self._request(
+            "POST", _sandbox_path(sandbox_id, "/rewind"), {"checkpoint_id": checkpoint_id}, timeout=max(self.timeout, 120.0)
+        )
+
+    def fork_sandbox(self, sandbox_id: str, n: int = 1) -> list[dict[str, Any]]:
+        """``n`` (1 to 100) running copies of the sandbox as it is now."""
+        _check_fork(n)
+        return (self._request("POST", _sandbox_path(sandbox_id, "/fork"), {"n": n}, timeout=max(self.timeout, 120.0)) or {}).get(
+            "sandboxes", []
+        )
 
     # Files (under files_root, at most 8 MiB) ---------------------------------
 
@@ -710,13 +931,15 @@ class AsyncKosa8Client:
         region: str | None = None,
         sleep_after_s: int | None = None,
         ttl_s: int | None = None,
+        delete_after: int | str | None = None,
     ) -> dict[str, Any]:
         """Start a sandbox and return its record once it is running.
 
-        A create that boots cold answers ``creating``; it is polled until it
-        runs, and deleted if it does not."""
+        ``ttl_s`` (60 s to 90 days) or ``delete_after`` (Unix ms or ISO 8601)
+        deletes it automatically. A create that boots cold answers
+        ``creating``; it is polled until it runs, and deleted if it does not."""
         r = await self._request(
-            "POST", "/v1/sandboxes", _create_body(template, region, sleep_after_s, ttl_s), timeout=max(self.timeout, 90.0)
+            "POST", "/v1/sandboxes", _create_body(template, region, sleep_after_s, ttl_s, delete_after), timeout=max(self.timeout, 90.0)
         )
         box = r["sandbox"]
         deadline = time.monotonic() + CREATE_WAIT_S
@@ -754,6 +977,67 @@ class AsyncKosa8Client:
 
     async def list_templates(self) -> list[dict[str, Any]]:
         return (await self._request("GET", "/v1/templates"))["templates"]
+
+    async def list_sandboxes(self, *, all: bool = False, limit: int | None = None, cursor: str | None = None) -> SandboxPage:
+        """One page of the org's sandboxes, newest first."""
+        return _page(await self._request("GET", _list_path(all, limit, cursor)))
+
+    async def iter_sandboxes(self, *, all: bool = False, page_size: int | None = None) -> AsyncIterator[dict[str, Any]]:
+        """Every sandbox, following ``next_cursor``."""
+        cursor: str | None = None
+        seen: set[str] = set()
+        while True:
+            page = await self.list_sandboxes(all=all, limit=page_size, cursor=cursor)
+            for sb in page.sandboxes:
+                yield sb
+            if not page.next_cursor or page.next_cursor in seen:
+                return
+            seen.add(page.next_cursor)
+            cursor = page.next_cursor
+
+    async def update_sandbox(
+        self,
+        sandbox_id: str,
+        *,
+        ttl_s: int | None = None,
+        delete_after: int | str | None = None,
+        sleep_after_s: int | None = None,
+        clear_lifetime: bool = False,
+    ) -> dict[str, Any]:
+        """Change a sandbox's lifetime or sleep timer (PATCH)."""
+        body = _update_body(ttl_s, delete_after, sleep_after_s, clear_lifetime)
+        return (await self._request("PATCH", _sandbox_path(sandbox_id), body))["sandbox"]
+
+    # Data plane: may answer 501 (Kosa8NotSupportedError) on some hosts -------
+
+    async def list_files(self, sandbox_id: str, path: str = FILES_API_ROOT) -> list[dict[str, Any]]:
+        """A folder's entries."""
+        resp = await self._send("GET", _sandbox_path(sandbox_id, "/files/list"), params={"path": path})
+        return (resp.json() or {}).get("files", [])
+
+    async def create_checkpoint(self, sandbox_id: str, label: str | None = None) -> dict[str, Any]:
+        """Save the sandbox's memory, processes and disk."""
+        body = {"label": label} if label is not None else {}
+        return (await self._request("POST", _sandbox_path(sandbox_id, "/checkpoints"), body, timeout=max(self.timeout, 120.0)))[
+            "checkpoint"
+        ]
+
+    async def list_checkpoints(self, sandbox_id: str) -> list[dict[str, Any]]:
+        """The sandbox's checkpoints, oldest first."""
+        return (await self._request("GET", _sandbox_path(sandbox_id, "/checkpoints")) or {}).get("checkpoints", [])
+
+    async def rewind_sandbox(self, sandbox_id: str, checkpoint_id: str) -> dict[str, Any]:
+        """Go back to a checkpoint; answers ``{sandbox, checkpoint, backup, ms}``."""
+        return await self._request(
+            "POST", _sandbox_path(sandbox_id, "/rewind"), {"checkpoint_id": checkpoint_id}, timeout=max(self.timeout, 120.0)
+        )
+
+    async def fork_sandbox(self, sandbox_id: str, n: int = 1) -> list[dict[str, Any]]:
+        """``n`` (1 to 100) running copies of the sandbox as it is now."""
+        _check_fork(n)
+        return (await self._request("POST", _sandbox_path(sandbox_id, "/fork"), {"n": n}, timeout=max(self.timeout, 120.0)) or {}).get(
+            "sandboxes", []
+        )
 
     # Files (under files_root, at most 8 MiB) ---------------------------------
 
